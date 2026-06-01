@@ -54,9 +54,24 @@ bool MappedInputManager::mapButton(const Button button, bool (HalGPIO::*fn)(uint
   return false;
 }
 
-bool MappedInputManager::wasPressed(const Button button) const { return mapButton(button, &HalGPIO::wasPressed); }
+// A short power tap acts as "Select" on menu screens. It is mapped to the power
+// RELEASE edge for BOTH the pressed and released Confirm queries: keying off the
+// release means a long power-off hold sleeps before any Select fires, while menus
+// that poll wasPressed(Confirm) still respond to a tap. The hold-Confirm gesture
+// (isPressed) is intentionally left untouched so it never reacts to the power button.
+bool MappedInputManager::wasPressed(const Button button) const {
+  if (powerAsConfirm && button == Button::Confirm && gpio.wasReleased(HalGPIO::BTN_POWER)) {
+    return true;
+  }
+  return mapButton(button, &HalGPIO::wasPressed);
+}
 
-bool MappedInputManager::wasReleased(const Button button) const { return mapButton(button, &HalGPIO::wasReleased); }
+bool MappedInputManager::wasReleased(const Button button) const {
+  if (powerAsConfirm && button == Button::Confirm && gpio.wasReleased(HalGPIO::BTN_POWER)) {
+    return true;
+  }
+  return mapButton(button, &HalGPIO::wasReleased);
+}
 
 bool MappedInputManager::isPressed(const Button button) const { return mapButton(button, &HalGPIO::isPressed); }
 

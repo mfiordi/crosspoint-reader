@@ -516,6 +516,13 @@ void loop() {
   gpio.update();
   halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, activityManager.isReaderActivity());
 
+  // A short power tap acts as "Select" on every menu screen. In the reading view it
+  // only does so when the user has chosen the OPEN_MENU action; other reader actions
+  // (page turn, force refresh, ...) read the power button directly elsewhere.
+  const bool foregroundReader = activityManager.isForegroundReaderActivity();
+  mappedInputManager.setPowerAsConfirm(!foregroundReader ||
+                                       SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::OPEN_MENU);
+
   renderer.setFadingFix(SETTINGS.fadingFix);
 
   if (Serial && millis() - lastMemPrint >= 10000) {
@@ -593,7 +600,8 @@ void loop() {
   }
 
   // Refresh screen when power button is short-pressed with FORCE_REFRESH setting.
-  if (SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::FORCE_REFRESH &&
+  // Scoped to the reading view so a power tap on menu screens acts as Select instead.
+  if (foregroundReader && SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::FORCE_REFRESH &&
       mappedInputManager.wasReleased(MappedInputManager::Button::Power)) {
     LOG_DBG("MAIN", "Manual screen refresh triggered");
     RenderLock lock;

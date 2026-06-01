@@ -101,6 +101,9 @@ class ActivityManager {
 
   bool preventAutoSleep() const;
   bool isReaderActivity() const;
+  // True only when the foreground (current) activity is an actual reading view,
+  // not when a reader-pushed menu/sub-activity is on top.
+  bool isForegroundReaderActivity() const;
   bool skipLoopDelay() const;
   ScreenshotInfo getScreenshotInfo() const;
 
