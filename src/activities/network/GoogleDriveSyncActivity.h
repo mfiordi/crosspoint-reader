@@ -10,13 +10,17 @@
 /**
  * Pulls books from a configured Google Drive folder over WiFi.
  *
- * Flow: enter OAuth client config on-device (first run only) -> connect WiFi ->
- * refresh the stored token, or run the OAuth device flow if there is none ->
- * list the folder -> download anything new or changed, skipping files already
- * present (md5 + existence dedup). Network listing/downloading runs
- * synchronously while a progress screen is shown (the FontDownloadActivity
- * pattern); the interactive device-code authorization is polled from loop() so
- * the user can cancel and the screen keeps refreshing.
+ * Config is supplied via a JSON file on the SD card (typing OAuth IDs on the
+ * e-ink keyboard is impractical): on first run the device writes an editable
+ * template to /.crosspoint/gdrive.json and asks the user to fill it in on a PC;
+ * on the next run it loads the file, obfuscating the plaintext secret in place.
+ *
+ * Once configured: connect WiFi -> refresh the stored token, or run the OAuth
+ * device flow if there is none -> list the folder -> download anything new or
+ * changed, skipping files already present (md5 + existence dedup). Network
+ * listing/downloading runs synchronously while a progress screen is shown (the
+ * FontDownloadActivity pattern); the interactive device-code authorization is
+ * polled from loop() so the user can cancel and the screen keeps refreshing.
  */
 class GoogleDriveSyncActivity final : public Activity {
  public:
@@ -35,7 +39,7 @@ class GoogleDriveSyncActivity final : public Activity {
 
  private:
   enum State {
-    CONFIG_ENTRY,      // entering clientId / secret / folderId via keyboard
+    CONFIG_NEEDED,     // config file missing/incomplete — instruct user to edit it on a PC
     WIFI_SELECTION,    // WifiSelectionActivity sub-activity is up
     AUTH_DEVICE_CODE,  // showing user code + QR, polling for authorization
     LISTING,           // fetching the folder listing
@@ -44,7 +48,7 @@ class GoogleDriveSyncActivity final : public Activity {
     ERROR,
   };
 
-  State state_ = CONFIG_ENTRY;
+  State state_ = CONFIG_NEEDED;
 
   // OAuth device-flow state
   GoogleDriveClient::DeviceCodeInfo deviceCode_;
@@ -63,13 +67,13 @@ class GoogleDriveSyncActivity final : public Activity {
   std::string currentFileName_;
 
   std::string errorMessage_;
+  std::string configMessage_;  // shown in the CONFIG_NEEDED state
   bool cancelRequested_ = false;
   bool wifiStarted_ = false;
 
-  // Config entry (first run): chained keyboard prompts.
-  void startConfigEntry();
-  void promptClientSecret();
-  void promptFolderId();
+  // Load the SD config file and route to the right state (CONFIG_NEEDED / ERROR
+  // / WIFI_SELECTION). Writes the editable template when no file exists.
+  void checkConfigAndStart();
 
   void startWifi();
   void onWifiSelectionComplete(bool connected);

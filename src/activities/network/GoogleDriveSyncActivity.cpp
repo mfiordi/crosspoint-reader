@@ -10,15 +10,10 @@
 #include "MappedInputManager.h"
 #include "SilentRestart.h"
 #include "activities/network/WifiSelectionActivity.h"
-#include "activities/util/KeyboardEntryActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/BookCacheUtils.h"
 #include "util/QrUtils.h"
-
-namespace {
-constexpr size_t CONFIG_FIELD_MAX = 128;
-}  // namespace
 
 GoogleDriveSyncActivity::GoogleDriveSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
     : Activity("GoogleDriveSync", renderer, mappedInput) {}
@@ -27,13 +22,7 @@ GoogleDriveSyncActivity::GoogleDriveSyncActivity(GfxRenderer& renderer, MappedIn
 
 void GoogleDriveSyncActivity::onEnter() {
   Activity::onEnter();
-  GDRIVE_STORE.loadFromFile();
-
-  if (!GDRIVE_STORE.hasConfig()) {
-    startConfigEntry();
-  } else {
-    startWifi();
-  }
+  checkConfigAndStart();
 }
 
 void GoogleDriveSyncActivity::onExit() {
@@ -48,59 +37,34 @@ void GoogleDriveSyncActivity::onExit() {
   }
 }
 
-// --- Config entry (first run): chained keyboard prompts ---
+// --- Config (file-based) ---
 
-void GoogleDriveSyncActivity::startConfigEntry() {
-  {
-    RenderLock lock(*this);
-    state_ = CONFIG_ENTRY;
+void GoogleDriveSyncActivity::checkConfigAndStart() {
+  switch (GDRIVE_STORE.loadConfig()) {
+    case GoogleDriveStore::ConfigStatus::Ready:
+      startWifi();
+      return;
+    case GoogleDriveStore::ConfigStatus::NoFile: {
+      // First run: drop an editable template on the SD for the user to fill in.
+      const bool wrote = GDRIVE_STORE.writeConfigTemplate();
+      RenderLock lock(*this);
+      state_ = CONFIG_NEEDED;
+      configMessage_ = wrote ? tr(STR_GDRIVE_CONFIG_CREATED) : tr(STR_GDRIVE_CONFIG_INVALID);
+      return;
+    }
+    case GoogleDriveStore::ConfigStatus::Incomplete: {
+      RenderLock lock(*this);
+      state_ = CONFIG_NEEDED;
+      configMessage_ = tr(STR_GDRIVE_CONFIG_INCOMPLETE);
+      return;
+    }
+    case GoogleDriveStore::ConfigStatus::Invalid: {
+      RenderLock lock(*this);
+      state_ = ERROR;
+      errorMessage_ = tr(STR_GDRIVE_CONFIG_INVALID);
+      return;
+    }
   }
-  startActivityForResult(
-      std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_GDRIVE_CLIENT_ID),
-                                              GDRIVE_STORE.getClientId(), CONFIG_FIELD_MAX, InputType::Text),
-      [this](const ActivityResult& result) {
-        if (result.isCancelled) {
-          finish();
-          return;
-        }
-        GDRIVE_STORE.setClientId(std::get<KeyboardResult>(result.data).text);
-        promptClientSecret();
-      });
-}
-
-void GoogleDriveSyncActivity::promptClientSecret() {
-  startActivityForResult(
-      std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_GDRIVE_CLIENT_SECRET),
-                                              GDRIVE_STORE.getClientSecret(), CONFIG_FIELD_MAX, InputType::Text),
-      [this](const ActivityResult& result) {
-        if (result.isCancelled) {
-          finish();
-          return;
-        }
-        GDRIVE_STORE.setClientSecret(std::get<KeyboardResult>(result.data).text);
-        promptFolderId();
-      });
-}
-
-void GoogleDriveSyncActivity::promptFolderId() {
-  startActivityForResult(
-      std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_GDRIVE_FOLDER_ID),
-                                              GDRIVE_STORE.getFolderId(), CONFIG_FIELD_MAX, InputType::Text),
-      [this](const ActivityResult& result) {
-        if (result.isCancelled) {
-          finish();
-          return;
-        }
-        GDRIVE_STORE.setFolderId(std::get<KeyboardResult>(result.data).text);
-        if (!GDRIVE_STORE.hasConfig()) {
-          // A field was left blank — don't proceed with an unusable config.
-          RenderLock lock(*this);
-          state_ = ERROR;
-          errorMessage_ = tr(STR_GDRIVE_NOT_CONFIGURED);
-          return;
-        }
-        startWifi();
-      });
 }
 
 // --- WiFi ---
@@ -317,7 +281,14 @@ std::string GoogleDriveSyncActivity::formatSize(size_t bytes) {
 // --- Input ---
 
 void GoogleDriveSyncActivity::loop() {
-  if (state_ == AUTH_DEVICE_CODE) {
+  if (state_ == CONFIG_NEEDED) {
+    // Re-reading the edited file is done by re-opening the menu item, so Back
+    // just exits.
+    if (mappedInput.wasPressed(MappedInputManager::Button::Back) ||
+        mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+      finish();
+    }
+  } else if (state_ == AUTH_DEVICE_CODE) {
     if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
       finish();
       return;
@@ -362,7 +333,12 @@ void GoogleDriveSyncActivity::render(RenderLock&&) {
   renderer.clearScreen();
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_GOOGLE_DRIVE_SYNC));
 
-  if (state_ == AUTH_DEVICE_CODE) {
+  if (state_ == CONFIG_NEEDED) {
+    renderer.drawCenteredText(UI_10_FONT_ID, centerY - lineHeight, configMessage_.c_str(), true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_10_FONT_ID, centerY + metrics.verticalSpacing, tr(STR_GDRIVE_CONFIG_EDIT_HINT));
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  } else if (state_ == AUTH_DEVICE_CODE) {
     const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
     renderer.drawCenteredText(UI_10_FONT_ID, contentTop, tr(STR_GDRIVE_VISIT_URL));
     renderer.drawCenteredText(UI_10_FONT_ID, contentTop + lineHeight, deviceCode_.verificationUrl);

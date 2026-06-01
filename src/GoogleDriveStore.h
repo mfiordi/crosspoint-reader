@@ -6,14 +6,25 @@
 /**
  * Persistent configuration and sync manifest for Google Drive book sync.
  *
- * Stored at /.crosspoint/gdrive.json. The OAuth client secret and refresh token
- * are XOR-obfuscated with the device MAC and base64-encoded (same scheme as WiFi
- * passwords); the client id, folder id and destination folder are stored in the
- * clear. The manifest maps a Drive fileId to the md5Checksum last downloaded,
- * which is how the sync skips books it already has.
+ * Stored at /.crosspoint/gdrive.json. The user supplies the OAuth client by
+ * editing this file on a PC: the device writes a template on first run, the
+ * user fills in clientId / clientSecret / folderId in plaintext, and on the next
+ * run the device obfuscates the secret in place (XOR with the device MAC, then
+ * base64 — same scheme as WiFi passwords) and rewrites the file. The refresh
+ * token (obtained via OAuth) is also stored obfuscated. The manifest maps a
+ * Drive fileId to the md5Checksum last downloaded, which is how the sync skips
+ * books it already has.
  */
 class GoogleDriveStore {
  public:
+  // Result of loading + validating the on-SD config file.
+  enum class ConfigStatus {
+    NoFile,      // file does not exist — caller should write a template
+    Invalid,     // file exists but is not parseable JSON — do NOT overwrite
+    Incomplete,  // parsed, but clientId/clientSecret/folderId not all filled in
+    Ready,       // all three present (secret obfuscated in place if needed)
+  };
+
   struct ManifestEntry {
     std::string fileId;
     std::string md5;
@@ -24,24 +35,29 @@ class GoogleDriveStore {
 
   static GoogleDriveStore& getInstance() { return instance; }
 
-  bool loadFromFile();
+  // Load + validate /.crosspoint/gdrive.json. If the secret was provided in
+  // plaintext (template just filled in by the user), it is obfuscated and the
+  // file rewritten before returning Ready.
+  ConfigStatus loadConfig();
+
+  // Write an editable template (empty fields + an _instructions string) for the
+  // user to fill in on a PC. Only call when loadConfig() returned NoFile so an
+  // edited file is never clobbered.
+  bool writeConfigTemplate() const;
+
   bool saveToFile() const;
 
-  // --- Config ---
+  // --- Config accessors ---
   const std::string& getClientId() const { return clientId; }
   const std::string& getClientSecret() const { return clientSecret; }
   const std::string& getFolderId() const { return folderId; }
   const std::string& getRefreshToken() const { return refreshToken; }
   const std::string& getSyncFolder() const { return syncFolder; }
 
-  // Setters persist only when the value actually changes (SPIFFS/SD write hygiene).
-  void setClientId(const std::string& v);
-  void setClientSecret(const std::string& v);
-  void setFolderId(const std::string& v);
+  // Persists only when the value actually changes (SD write hygiene). Used by
+  // the OAuth flow to store the refresh token after authorization.
   void setRefreshToken(const std::string& v);
-  void setSyncFolder(const std::string& v);
 
-  // True once the user-supplied OAuth client + target folder are all set.
   bool hasConfig() const { return !clientId.empty() && !clientSecret.empty() && !folderId.empty(); }
   bool hasRefreshToken() const { return !refreshToken.empty(); }
 

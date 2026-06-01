@@ -10,8 +10,9 @@ code without reading every line.
 
 `Settings → System → Google Drive Sync` runs a one-shot sync:
 
-1. First run only: enter the OAuth **Client ID**, **Client Secret**, and **Folder ID** via
-   the on-screen keyboard (persisted, so it's a one-time step).
+1. First run only: the device writes an editable `/.crosspoint/gdrive.json` template; the user
+   fills in the OAuth **Client ID**, **Client Secret**, and **Folder ID** in a text editor on a
+   PC. On the next run the device obfuscates the secret in place (one-time step).
 2. Connect to WiFi.
 3. Authorize once via the **OAuth 2.0 device flow** (the device shows a short code + URL +
    QR; the user approves on a phone). A refresh token is stored; later syncs reuse it with
@@ -47,32 +48,33 @@ These mirror existing patterns: the activity is modelled on `FontDownloadActivit
 `GoogleDriveSyncActivity` (see the `State` enum in the header) progresses:
 
 ```text
-onEnter
+onEnter ─► checkConfigAndStart() ─► GoogleDriveStore::loadConfig()
   │
-  ├─ no config? ─► CONFIG_ENTRY ──(3 keyboard prompts: id, secret, folder)─┐
-  │                                                                        │
-  └─ has config? ─────────────────────────────────────────────────────────┤
-                                                                           ▼
-                                                                     WIFI_SELECTION
-                                                                           │ (connected)
-                                                                           ▼
-                                                                     beginAuthOrSync()
-                                                  ┌────────────────────────┴───────────────┐
-                                       has refresh token?                          no refresh token
-                                                  │                                         │
-                                          refreshAccessToken()                       AUTH_DEVICE_CODE
-                                          ┌───────┴────────┐                  (show code+QR, poll token)
-                                       ok │            failed │                          │ success
-                                          ▼                 ▼                            ▼
-                                       runSync()      start device flow ────────────► runSync()
-                                          │
-                                          ▼
-                                   LISTING ─► SYNCING ─► COMPLETE
-                                          (any failure) ─► ERROR
+  ├─ NoFile      ─► writeConfigTemplate() ─► CONFIG_NEEDED ("created, edit on PC")
+  ├─ Incomplete  ─────────────────────────► CONFIG_NEEDED ("incomplete, edit & rerun")
+  ├─ Invalid     ─────────────────────────► ERROR ("config invalid", file left intact)
+  └─ Ready ───────────────────────────────► WIFI_SELECTION
+                                                  │ (connected)
+                                                  ▼
+                                            beginAuthOrSync()
+                         ┌────────────────────────┴───────────────┐
+              has refresh token?                          no refresh token
+                         │                                         │
+                 refreshAccessToken()                       AUTH_DEVICE_CODE
+                 ┌───────┴────────┐                  (show code+QR, poll token)
+              ok │            failed │                          │ success
+                 ▼                 ▼                            ▼
+              runSync()      start device flow ────────────► runSync()
+                 │
+                 ▼
+          LISTING ─► SYNCING ─► COMPLETE
+                 (any failure) ─► ERROR
 ```
 
-- **CONFIG_ENTRY** chains `KeyboardEntryActivity` three times via `startActivityForResult`.
-  Cancelling any prompt aborts the activity.
+- **CONFIG_NEEDED** is a static instruction screen (config file missing or incomplete). The
+  user edits `/.crosspoint/gdrive.json` on a PC and re-opens the menu item to re-read it;
+  **Back** exits. The template is written only when the file is absent, so an edited file is
+  never clobbered.
 - **AUTH_DEVICE_CODE** is the only interactive-while-networking state: `loop()` polls the
   token endpoint at the server-provided interval (honoring `slow_down`) until the user
   authorizes, the code expires, or the user presses Back.
@@ -147,25 +149,49 @@ layout so the home/file browser re-parses the new book. The manifest is persiste
 `GoogleDriveStore::saveToFile()` after the run (and on a mid-run download failure, to keep the
 records earned so far).
 
-## On-disk format: `/.crosspoint/gdrive.json`
+## On-disk format & config lifecycle: `/.crosspoint/gdrive.json`
 
-Written by `GoogleDriveStore`, mirroring the obfuscation scheme used for WiFi/OPDS credentials
-(`obfuscation::obfuscateToBase64` — XOR with the device MAC, then base64; not cryptographic,
-but ties secrets to the device and prevents casual reading).
+Configuration is **file-based** — the user edits this file on a PC rather than typing OAuth IDs
+on the device. `GoogleDriveStore` has three relevant entry points:
 
-```jsonc
-{
-  "clientId":         "….apps.googleusercontent.com", // plaintext
-  "folderId":         "1Ab…",                          // plaintext
-  "syncFolder":       "/",                             // SD destination, plaintext
-  "clientSecret_obf": "…",                             // obfuscated
-  "refreshToken_obf": "…",                             // obfuscated
-  "manifest": [ { "id": "<fileId>", "md5": "<32 hex>" }, … ]
-}
-```
+- `writeConfigTemplate()` — writes an editable, pretty-printed template when no file exists:
 
-Setters are change-guarded (`if (v == field) return;`) so unchanged values don't trigger SD
-writes.
+  ```jsonc
+  {
+    "_instructions": "Fill in clientId, clientSecret and folderId … (security warning)",
+    "clientId": "", "clientSecret": "", "folderId": "", "syncFolder": "/"
+  }
+  ```
+
+  Note `clientSecret` here is a **plaintext** key — what the user pastes into.
+
+- `loadConfig()` → `ConfigStatus { NoFile, Invalid, Incomplete, Ready }`. It reads the
+  obfuscated `clientSecret_obf` if present; otherwise it falls back to the plaintext
+  `clientSecret` key (the just-filled template) and flags a re-save. Returns `Incomplete` if any
+  of clientId/clientSecret/folderId is blank, `Invalid` on a JSON parse error (the file is **not**
+  overwritten in that case), else `Ready`.
+
+- `saveToFile()` — writes the configured form, **never** plaintext secrets:
+
+  ```jsonc
+  {
+    "_instructions":    "Configured. clientSecret and refreshToken are obfuscated …",
+    "clientId":         "….apps.googleusercontent.com", // plaintext
+    "folderId":         "1Ab…",                          // plaintext
+    "syncFolder":       "/",                             // SD destination, plaintext
+    "clientSecret_obf": "…",                             // obfuscated
+    "refreshToken_obf": "…",                             // obfuscated (set after OAuth)
+    "manifest": [ { "id": "<fileId>", "md5": "<32 hex>" }, … ]
+  }
+  ```
+
+The **plaintext→obfuscated migration** is the key behaviour: the first `loadConfig()` after the
+user fills in the template sees the plaintext `clientSecret`, returns `Ready`, and immediately
+calls `saveToFile()` — which writes `clientSecret_obf` and drops the plaintext key. Using two
+distinct keys (`clientSecret` vs `clientSecret_obf`) makes "is it obfuscated yet?" unambiguous.
+Obfuscation reuses `obfuscation::obfuscateToBase64`/`deobfuscateFromBase64`
+(`lib/Serialization/ObfuscationUtils.h`) — XOR with the device MAC then base64: not cryptographic,
+but ties secrets to the device and prevents casual reading off the card.
 
 ## Image optimization is out of scope
 

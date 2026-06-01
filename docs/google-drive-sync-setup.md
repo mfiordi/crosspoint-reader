@@ -72,22 +72,46 @@ Do all of this **while signed in to your books-only Google account** (see the wa
 
 ---
 
-## Part 3 — Enter everything on the device
+## Part 3 — Configure the device (via a file on the SD card)
 
-1. On the device: **Settings → System → Google Drive Sync**.
-2. The first time, it asks for three things via the on-screen keyboard — enter them in order:
-   - **Drive Client ID**
-   - **Drive Client Secret**
-   - **Drive Folder ID**
-   These are saved to the SD card, so you only type them once.
-3. The device connects to **WiFi** (pick your network).
-4. **Authorize:** the screen shows a short **code**, a **URL**, and a **QR code**. On your
+Typing long OAuth IDs on the e-ink keyboard is painful, so configuration is done by editing a
+small JSON file on the SD card from your PC.
+
+1. On the device: **Settings → System → Google Drive Sync**. The first time, it creates the
+   file `/.crosspoint/gdrive.json` on the SD card and shows *"Config file created — edit
+   /.crosspoint/gdrive.json on your PC, then run again."* Press **Back**.
+2. Power off the device, take out the SD card, and put it in your PC.
+3. Open **`/.crosspoint/gdrive.json`** in any text editor. It looks like this:
+
+   ```json
+   {
+     "_instructions": "Fill in clientId, clientSecret and folderId, then run Google Drive Sync again ...",
+     "clientId": "",
+     "clientSecret": "",
+     "folderId": "",
+     "syncFolder": "/"
+   }
+   ```
+
+   Paste your three values between the quotes:
+   - `clientId` → the Client ID from Part 1
+   - `clientSecret` → the Client Secret from Part 1
+   - `folderId` → the Folder ID from Part 2
+   - `syncFolder` (optional) → where on the SD card to save books; leave as `"/"` for the root.
+
+   Save the file. (Leave `_instructions` as-is; it's just a reminder and is ignored.)
+4. Put the SD card back in the device and open **Settings → System → Google Drive Sync** again.
+   The device reads your file and — for security — **scrambles the `clientSecret` so it can't be
+   read off the card** (it'll look like gibberish afterward; that's expected and only works on
+   this device).
+5. The device connects to **WiFi** (pick your network).
+6. **Authorize:** the screen shows a short **code**, a **URL**, and a **QR code**. On your
    phone, open the URL (or scan the QR), sign in **as your books account**, enter the code, and
    approve read-only access.
-5. The device lists your folder and downloads the books. Done!
+7. The device lists your folder and downloads the books. Done!
 
 **Next time** you just open Google Drive Sync again — it remembers your login and only
-downloads books that are new or changed.
+downloads books that are new or changed. No editing or re-authorizing needed.
 
 ---
 
@@ -96,13 +120,15 @@ downloads books that are new or changed.
 - **Books are downloaded as-is.** The device does not shrink or convert images during sync, so
   put already-optimized books in the folder. (You can optimize them with the device's web
   uploader before placing them in Drive.)
+- **"Config incomplete":** one of `clientId` / `clientSecret` / `folderId` is still empty in
+  the file — edit it on your PC and run again.
+- **"Config file invalid":** the JSON is malformed (a missing quote or comma). Fix it in the
+  editor (or delete the file and let the device recreate the template), then run again.
 - **"Access denied" / sign-in fails:** make sure the Google account you authorize with is
   listed as a **Test user** on the consent screen (Part 1, step 3.5), and that you signed in as
   that same account on your phone.
 - **Nothing downloads:** confirm the Folder ID is correct and that the books are *directly*
   inside that folder (sub-folders aren't scanned). Only `.epub`, `.txt`, and `.xtc`/`.xtch`
   files are picked up.
-- **Re-typing credentials:** they're stored on the SD card. Deleting `/.crosspoint/gdrive.json`
-  resets the configuration.
-- **Changing accounts:** if you ever need to re-authorize, delete `/.crosspoint/gdrive.json`
-  and run Google Drive Sync again.
+- **Reconfiguring / changing accounts:** delete `/.crosspoint/gdrive.json` and run Google Drive
+  Sync again — the device recreates the editable template.
