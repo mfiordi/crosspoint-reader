@@ -15,12 +15,11 @@
  * template to /.crosspoint/gdrive.json and asks the user to fill it in on a PC;
  * on the next run it loads the file, obfuscating the plaintext secret in place.
  *
- * Once configured: connect WiFi -> refresh the stored token, or run the OAuth
- * device flow if there is none -> list the folder -> download anything new or
- * changed, skipping files already present (md5 + existence dedup). Network
- * listing/downloading runs synchronously while a progress screen is shown (the
- * FontDownloadActivity pattern); the interactive device-code authorization is
- * polled from loop() so the user can cancel and the screen keeps refreshing.
+ * Once configured: connect WiFi -> sync the clock (NTP) and mint an access
+ * token from the service-account key (JWT-bearer) -> list the folder ->
+ * download anything new or changed, skipping files already present (md5 +
+ * existence dedup). Network listing/downloading runs synchronously while a
+ * progress screen is shown (the FontDownloadActivity pattern).
  */
 class GoogleDriveSyncActivity final : public Activity {
  public:
@@ -32,30 +31,24 @@ class GoogleDriveSyncActivity final : public Activity {
   void render(RenderLock&&) override;
 
   bool preventAutoSleep() override {
-    return state_ == AUTH_DEVICE_CODE || state_ == LISTING || state_ == SYNCING || state_ == COMPLETE ||
-           state_ == ERROR;
+    return state_ == AUTHENTICATING || state_ == LISTING || state_ == SYNCING || state_ == COMPLETE || state_ == ERROR;
   }
   bool skipLoopDelay() override { return true; }
 
  private:
   enum State {
-    CONFIG_NEEDED,     // config file missing/incomplete — instruct user to edit it on a PC
-    WIFI_SELECTION,    // WifiSelectionActivity sub-activity is up
-    AUTH_DEVICE_CODE,  // showing user code + QR, polling for authorization
-    LISTING,           // fetching the folder listing
-    SYNCING,           // downloading new/changed files
+    CONFIG_NEEDED,   // config file missing/incomplete — instruct user to edit it on a PC
+    WIFI_SELECTION,  // WifiSelectionActivity sub-activity is up
+    AUTHENTICATING,  // syncing clock + minting a service-account access token
+    LISTING,         // fetching the folder listing
+    SYNCING,         // downloading new/changed files
     COMPLETE,
     ERROR,
   };
 
   State state_ = CONFIG_NEEDED;
 
-  // OAuth device-flow state
-  GoogleDriveClient::DeviceCodeInfo deviceCode_;
   std::string accessToken_;
-  unsigned long nextPollMs_ = 0;
-  unsigned long authExpiryMs_ = 0;
-  int pollIntervalSec_ = 5;
 
   // Listing / sync progress
   std::vector<GoogleDriveClient::DriveFile> files_;
@@ -78,10 +71,9 @@ class GoogleDriveSyncActivity final : public Activity {
   void startWifi();
   void onWifiSelectionComplete(bool connected);
 
-  // After WiFi is up: refresh the token or kick off the device flow.
-  void beginAuthOrSync();
-  void startDeviceAuth();
-  void pollAuth();
+  // After WiFi is up: sync the clock, mint a service-account access token, then
+  // run the sync. Sets state_/errorMessage_ on failure.
+  void authenticateAndSync();
 
   // Synchronous listing + download. Sets state_/errorMessage_ on failure.
   void runSync();

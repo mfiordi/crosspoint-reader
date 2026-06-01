@@ -7,16 +7,17 @@
 
 namespace {
 constexpr char GDRIVE_FILE_JSON[] = "/.crosspoint/gdrive.json";
+constexpr char DEFAULT_TOKEN_URI[] = "https://oauth2.googleapis.com/token";
 
 // Shown inside the JSON itself so a user who opens the file knows what to do.
 // Plain ASCII, single line (valid JSON string value — no comments allowed).
 constexpr char TEMPLATE_INSTRUCTIONS[] =
-    "Fill in clientId, clientSecret and folderId, then run Google Drive Sync again on the "
-    "device. WARNING: these credentials grant READ access to the ENTIRE Google Drive of the "
-    "account you authorize - use a dedicated account that only holds your books. See "
-    "docs/google-drive-sync-setup.md.";
+    "Paste your Google service-account JSON contents into 'serviceAccount' (client_email, "
+    "private_key, token_uri), set folderId, then run Google Drive Sync again. SHARE the books "
+    "folder with the service account's client_email (read access). The key only grants access "
+    "to what you share. See docs/google-drive-sync-setup.md.";
 constexpr char CONFIGURED_NOTE[] =
-    "Configured. clientSecret and refreshToken are obfuscated for this device. To reconfigure, "
+    "Configured. The service-account private key is obfuscated for this device. To reconfigure, "
     "delete this file and run Google Drive Sync again.";
 }  // namespace
 
@@ -35,25 +36,27 @@ GoogleDriveStore::ConfigStatus GoogleDriveStore::loadConfig() {
     return ConfigStatus::Invalid;
   }
 
-  clientId = doc["clientId"] | std::string("");
   folderId = doc["folderId"] | std::string("");
   syncFolder = doc["syncFolder"] | std::string("/");
   if (syncFolder.empty()) syncFolder = "/";
 
-  // Secret: prefer the obfuscated form; fall back to a plaintext "clientSecret"
-  // field (the template the user just filled in) and flag for re-save so it gets
-  // obfuscated in place.
+  // The user pastes Google's service-account JSON under "serviceAccount".
+  JsonObject sa = doc["serviceAccount"].as<JsonObject>();
+  clientEmail = sa["client_email"] | std::string("");
+  tokenUri = sa["token_uri"] | std::string(DEFAULT_TOKEN_URI);
+  if (tokenUri.empty()) tokenUri = DEFAULT_TOKEN_URI;
+
+  // Private key: prefer the obfuscated form; fall back to the plaintext
+  // "private_key" (the freshly-pasted key) and flag for re-save so it gets
+  // obfuscated in place. ArduinoJson already turns the JSON \n escapes into real
+  // newlines, so the PEM is usable as-is.
   bool needsResave = false;
   bool ok = false;
-  clientSecret = obfuscation::deobfuscateFromBase64(doc["clientSecret_obf"] | "", &ok);
-  if (!ok || clientSecret.empty()) {
-    clientSecret = doc["clientSecret"] | std::string("");
-    if (!clientSecret.empty()) needsResave = true;
+  privateKey = obfuscation::deobfuscateFromBase64(doc["privateKey_obf"] | "", &ok);
+  if (!ok || privateKey.empty()) {
+    privateKey = sa["private_key"] | std::string("");
+    if (!privateKey.empty()) needsResave = true;
   }
-
-  ok = false;
-  refreshToken = obfuscation::deobfuscateFromBase64(doc["refreshToken_obf"] | "", &ok);
-  if (!ok) refreshToken.clear();
 
   manifest.clear();
   JsonArray arr = doc["manifest"].as<JsonArray>();
@@ -70,10 +73,11 @@ GoogleDriveStore::ConfigStatus GoogleDriveStore::loadConfig() {
     return ConfigStatus::Incomplete;
   }
 
-  // Rewrite so the plaintext secret is replaced by its obfuscated form (and the
-  // plaintext key is dropped). saveToFile() never writes plaintext secrets.
+  // Rewrite so the plaintext key is replaced by its obfuscated form (and the
+  // plaintext serviceAccount.private_key is dropped). saveToFile() never writes
+  // the plaintext key.
   if (needsResave) {
-    LOG_DBG("GDRIVE", "obfuscating plaintext secret in config file");
+    LOG_DBG("GDRIVE", "obfuscating plaintext private key in config file");
     saveToFile();
   }
 
@@ -86,10 +90,12 @@ bool GoogleDriveStore::writeConfigTemplate() const {
 
   JsonDocument doc;
   doc["_instructions"] = TEMPLATE_INSTRUCTIONS;
-  doc["clientId"] = "";
-  doc["clientSecret"] = "";
   doc["folderId"] = "";
   doc["syncFolder"] = "/";
+  JsonObject sa = doc["serviceAccount"].to<JsonObject>();
+  sa["client_email"] = "";
+  sa["private_key"] = "";
+  sa["token_uri"] = DEFAULT_TOKEN_URI;
 
   String json;
   serializeJsonPretty(doc, json);  // pretty so it's easy to edit on a PC
@@ -101,12 +107,14 @@ bool GoogleDriveStore::saveToFile() const {
 
   JsonDocument doc;
   doc["_instructions"] = CONFIGURED_NOTE;
-  doc["clientId"] = clientId;
   doc["folderId"] = folderId;
   doc["syncFolder"] = syncFolder;
-  // Secrets are written only in obfuscated form; never persist plaintext.
-  doc["clientSecret_obf"] = obfuscation::obfuscateToBase64(clientSecret);
-  doc["refreshToken_obf"] = obfuscation::obfuscateToBase64(refreshToken);
+  // Keep the non-secret service-account fields visible; the private key is
+  // written only in obfuscated form (never plaintext).
+  JsonObject sa = doc["serviceAccount"].to<JsonObject>();
+  sa["client_email"] = clientEmail;
+  sa["token_uri"] = tokenUri;
+  doc["privateKey_obf"] = obfuscation::obfuscateToBase64(privateKey);
 
   JsonArray arr = doc["manifest"].to<JsonArray>();
   for (const auto& e : manifest) {
@@ -118,12 +126,6 @@ bool GoogleDriveStore::saveToFile() const {
   String json;
   serializeJsonPretty(doc, json);
   return Storage.writeFile(GDRIVE_FILE_JSON, json);
-}
-
-void GoogleDriveStore::setRefreshToken(const std::string& v) {
-  if (v == refreshToken) return;
-  refreshToken = v;
-  saveToFile();
 }
 
 const std::string* GoogleDriveStore::findMd5(const std::string& fileId) const {

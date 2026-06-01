@@ -5,6 +5,7 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <WiFi.h>
+#include <esp_sntp.h>
 
 #include "GoogleDriveStore.h"
 #include "MappedInputManager.h"
@@ -12,8 +13,8 @@
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "network/GoogleJwtAuth.h"
 #include "util/BookCacheUtils.h"
-#include "util/QrUtils.h"
 
 GoogleDriveSyncActivity::GoogleDriveSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
     : Activity("GoogleDriveSync", renderer, mappedInput) {}
@@ -85,88 +86,48 @@ void GoogleDriveSyncActivity::onWifiSelectionComplete(const bool connected) {
     finish();
     return;
   }
-  beginAuthOrSync();
+  authenticateAndSync();
 }
 
 // --- Auth + sync ---
 
-void GoogleDriveSyncActivity::beginAuthOrSync() {
-  if (GDRIVE_STORE.hasRefreshToken()) {
-    {
-      RenderLock lock(*this);
-      state_ = LISTING;  // shows "Authorizing/Listing" while the blocking calls run
-    }
-    requestUpdateAndWait();
-
-    if (GoogleDriveClient::refreshAccessToken(GDRIVE_STORE.getClientId(), GDRIVE_STORE.getClientSecret(),
-                                              GDRIVE_STORE.getRefreshToken(), accessToken_)) {
-      runSync();
-      return;
-    }
-    // Stored token was revoked/invalid — fall through to a fresh authorization.
-    LOG_DBG("GDRIVE", "refresh failed; starting device flow");
-    GDRIVE_STORE.setRefreshToken("");
+namespace {
+// Sync the system clock from NTP. The X4 has no RTC, so time(nullptr) is only
+// real epoch after this; the JWT's iat/exp need it. Same pattern as
+// KOReaderSyncActivity. Blocks up to ~5s.
+void syncTimeWithNTP() {
+  if (esp_sntp_enabled()) esp_sntp_stop();
+  esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+  esp_sntp_setservername(0, "pool.ntp.org");
+  esp_sntp_init();
+  int retry = 0;
+  const int maxRetries = 50;  // 5 seconds max
+  while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && retry < maxRetries) {
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    retry++;
   }
-  startDeviceAuth();
 }
+}  // namespace
 
-void GoogleDriveSyncActivity::startDeviceAuth() {
-  if (!GoogleDriveClient::requestDeviceCode(GDRIVE_STORE.getClientId(), deviceCode_)) {
-    RenderLock lock(*this);
-    state_ = ERROR;
-    errorMessage_ = detailOr(tr(STR_GDRIVE_AUTH_FAILED));
-    return;
-  }
-
-  pollIntervalSec_ = deviceCode_.interval > 0 ? deviceCode_.interval : 5;
-  const unsigned long now = millis();
-  nextPollMs_ = now + static_cast<unsigned long>(pollIntervalSec_) * 1000UL;
-  authExpiryMs_ = now + static_cast<unsigned long>(deviceCode_.expiresIn) * 1000UL;
-
+void GoogleDriveSyncActivity::authenticateAndSync() {
   {
     RenderLock lock(*this);
-    state_ = AUTH_DEVICE_CODE;
+    state_ = AUTHENTICATING;
   }
-  requestUpdate();
-}
+  requestUpdateAndWait();
 
-void GoogleDriveSyncActivity::pollAuth() {
-  std::string refresh = GDRIVE_STORE.getRefreshToken();
-  const auto status = GoogleDriveClient::pollForToken(GDRIVE_STORE.getClientId(), GDRIVE_STORE.getClientSecret(),
-                                                      deviceCode_.deviceCode, refresh, accessToken_);
+  // JWT iat/exp need a correct wall clock; the X4 has no RTC.
+  syncTimeWithNTP();
 
-  switch (status) {
-    case GoogleDriveClient::PollStatus::SUCCESS:
-      GDRIVE_STORE.setRefreshToken(refresh);  // persists for next time
-      runSync();
-      return;
-    case GoogleDriveClient::PollStatus::PENDING:
-      nextPollMs_ = millis() + static_cast<unsigned long>(pollIntervalSec_) * 1000UL;
-      return;
-    case GoogleDriveClient::PollStatus::SLOW_DOWN:
-      pollIntervalSec_ += 5;
-      nextPollMs_ = millis() + static_cast<unsigned long>(pollIntervalSec_) * 1000UL;
-      return;
-    case GoogleDriveClient::PollStatus::DENIED: {
-      RenderLock lock(*this);
-      state_ = ERROR;
-      errorMessage_ = detailOr(tr(STR_GDRIVE_ACCESS_DENIED));
-      return;
-    }
-    case GoogleDriveClient::PollStatus::EXPIRED: {
-      RenderLock lock(*this);
-      state_ = ERROR;
-      errorMessage_ = detailOr(tr(STR_GDRIVE_CODE_EXPIRED));
-      return;
-    }
-    case GoogleDriveClient::PollStatus::ERROR:
-    default: {
-      RenderLock lock(*this);
-      state_ = ERROR;
-      errorMessage_ = detailOr(tr(STR_GDRIVE_AUTH_FAILED));
-      return;
-    }
+  if (!GoogleJwtAuth::getAccessToken(GDRIVE_STORE.getClientEmail(), GDRIVE_STORE.getPrivateKey(),
+                                     GDRIVE_STORE.getTokenUri(), GoogleJwtAuth::SCOPE_DRIVE_READONLY, accessToken_)) {
+    RenderLock lock(*this);
+    state_ = ERROR;
+    errorMessage_ =
+        GoogleJwtAuth::lastError().empty() ? std::string(tr(STR_GDRIVE_AUTH_FAILED)) : GoogleJwtAuth::lastError();
+    return;
   }
+  runSync();
 }
 
 void GoogleDriveSyncActivity::runSync() {
@@ -293,20 +254,6 @@ void GoogleDriveSyncActivity::loop() {
         mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
       finish();
     }
-  } else if (state_ == AUTH_DEVICE_CODE) {
-    if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
-      finish();
-      return;
-    }
-    if (static_cast<long>(millis() - authExpiryMs_) >= 0) {
-      RenderLock lock(*this);
-      state_ = ERROR;
-      errorMessage_ = tr(STR_GDRIVE_CODE_EXPIRED);
-      return;
-    }
-    if (static_cast<long>(millis() - nextPollMs_) >= 0) {
-      pollAuth();
-    }
   } else if (state_ == COMPLETE) {
     if (mappedInput.wasPressed(MappedInputManager::Button::Back) ||
         mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
@@ -318,7 +265,7 @@ void GoogleDriveSyncActivity::loop() {
     } else if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
       // Retry the network steps if we still have a connection.
       if (wifiStarted_ && WiFi.status() == WL_CONNECTED && GDRIVE_STORE.hasConfig()) {
-        beginAuthOrSync();
+        authenticateAndSync();
       } else {
         finish();
       }
@@ -356,23 +303,8 @@ void GoogleDriveSyncActivity::render(RenderLock&&) {
     drawWrappedCentered(y + metrics.verticalSpacing, tr(STR_GDRIVE_CONFIG_EDIT_HINT), 3, EpdFontFamily::REGULAR);
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-  } else if (state_ == AUTH_DEVICE_CODE) {
-    const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
-    renderer.drawCenteredText(UI_10_FONT_ID, contentTop, tr(STR_GDRIVE_VISIT_URL));
-    renderer.drawCenteredText(UI_10_FONT_ID, contentTop + lineHeight, deviceCode_.verificationUrl);
-
-    // QR of the verification URL so the user can open it from their phone.
-    const int qrSize = pageHeight / 3;
-    const int qrY = contentTop + lineHeight * 3;
-    QrUtils::drawQrCode(renderer, Rect{(pageWidth - qrSize) / 2, qrY, qrSize, qrSize},
-                        std::string(deviceCode_.verificationUrl));
-
-    const int codeY = qrY + qrSize + metrics.verticalSpacing;
-    renderer.drawCenteredText(UI_10_FONT_ID, codeY, tr(STR_GDRIVE_ENTER_CODE));
-    renderer.drawCenteredText(UI_12_FONT_ID, codeY + lineHeight, deviceCode_.userCode, true, EpdFontFamily::BOLD);
-
-    const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), "", "", "");
-    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  } else if (state_ == AUTHENTICATING) {
+    renderer.drawCenteredText(UI_10_FONT_ID, centerY, tr(STR_GDRIVE_AUTHENTICATING));
   } else if (state_ == LISTING) {
     renderer.drawCenteredText(UI_10_FONT_ID, centerY, tr(STR_GDRIVE_LISTING));
   } else if (state_ == SYNCING) {

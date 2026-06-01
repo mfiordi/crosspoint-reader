@@ -1,37 +1,44 @@
 # Google Drive Book Sync
 
-This document explains the Google Drive sync feature: a Settings action that pulls books
-from a Google Drive folder onto the device over WiFi, skipping anything already present. It
-covers the architecture, the OAuth flow, the on-disk formats, and how the pieces fit
-together — enough for a contributor (or an AI agent) to understand and safely modify the
-code without reading every line.
+This document explains the Google Drive sync feature: a menu action that pulls books from a
+Google Drive folder onto the device over WiFi, skipping anything already present. It covers
+the architecture, the service-account auth (JWT-bearer), the on-disk formats, and how the
+pieces fit together — enough for a contributor (or an AI agent) to understand and safely
+modify the code without reading every line.
 
 ## Overview
 
-`Settings → System → Google Drive Sync` runs a one-shot sync:
+**Google Drive Sync** (from Settings → System, or Home → File Transfer) runs a one-shot sync:
 
 1. First run only: the device writes an editable `/.crosspoint/gdrive.json` template; the user
-   fills in the OAuth **Client ID**, **Client Secret**, and **Folder ID** in a text editor on a
-   PC. On the next run the device obfuscates the secret in place (one-time step).
+   pastes a Google **service-account JSON** (client_email + private_key) and the **Folder ID**
+   in a text editor on a PC. On the next run the device obfuscates the private key in place.
 2. Connect to WiFi.
-3. Authorize once via the **OAuth 2.0 device flow** (the device shows a short code + URL +
-   QR; the user approves on a phone). A refresh token is stored; later syncs reuse it with
-   no re-auth.
+3. **Authenticate** without any phone/consent step: sync the clock via NTP, build a JWT, sign it
+   RS256 with the service-account key, and exchange it for an access token (OAuth2 JWT-bearer
+   grant). See [Service-account authentication](#service-account-authentication-jwt-bearer).
 4. List the folder and **download new/changed books**, skipping files already on the card.
 
 The device **only reads** from Drive (scope `drive.readonly`) and **only downloads** —
 it never writes, deletes, or uploads. Books are pulled **as-is**; the device does not
 optimize/transcode them (see [Image optimization is out of scope](#image-optimization-is-out-of-scope)).
 
-> **Setting it up?** End-user steps for creating the OAuth credentials and finding the Folder
-> ID are in [google-drive-sync-setup.md](google-drive-sync-setup.md). This document is the
-> developer/architecture reference.
+> **Why a service account?** Google's OAuth **device-code (QR) flow forbids `drive.readonly`**
+> (`invalid_scope`), and the allowed `drive.file` scope can't list a user-populated folder — so
+> the QR approach is a dead end for this use case. A service account sidesteps OAuth consent
+> entirely, and because a service account only sees what's **shared with it**, sharing just the
+> books folder scopes the device to exactly that folder.
+
+> **Setting it up?** End-user steps (create the service account + key, share the folder, find
+> the Folder ID) are in [google-drive-sync-setup.md](google-drive-sync-setup.md). This document
+> is the developer/architecture reference.
 
 ## Components
 
 | File | Role |
 |------|------|
-| `src/network/GoogleDriveClient.{h,cpp}` | Stateless Drive v3 + OAuth client (network + JSON only, no UI/SD-listing) |
+| `src/network/GoogleJwtAuth.{h,cpp}` | Mints access tokens from the service-account key (RS256 JWT-bearer, mbedTLS) |
+| `src/network/GoogleDriveClient.{h,cpp}` | Stateless Drive v3 list/download (network + JSON only, no UI/SD-listing) |
 | `src/GoogleDriveStore.{h,cpp}` | Persistent config + dedup manifest (`/.crosspoint/gdrive.json`) |
 | `src/activities/network/GoogleDriveSyncActivity.{h,cpp}` | The UI/state-machine that drives the flow |
 | `src/network/HttpDownloader.{h,cpp}` | Shared HTTP client; extended here with `postForm()` + Bearer-token auth |
@@ -47,10 +54,11 @@ Google Drive Sync* (the latter is the quicker path). Both launch the same
 ### Diagnostics
 
 Failures are surfaced three ways: an on-screen message (word-wrapped), the serial log
-(`GDRIVE` tag), and an appended line in **`/.crosspoint/gdrive_log.txt`** on the SD card (kept
-under 32 KB). `GoogleDriveClient::lastError()` holds the detailed reason — failing step + HTTP
-status + Google's JSON `error`/`error_description` (e.g. `invalid_client`) — which the activity
-shows instead of the generic "Authorization failed" so the cause is diagnosable without serial.
+(`GDRIVE`/`GJWT` tags), and an appended line in **`/.crosspoint/gdrive_log.txt`** on the SD card
+(kept under 32 KB). Both `GoogleJwtAuth::lastError()` (auth) and `GoogleDriveClient::lastError()`
+(listing/download) hold a detailed reason — failing step + HTTP status + Google's JSON
+`error`/`error_description` (e.g. `invalid_grant`) — which the activity shows instead of the
+generic "Authentication failed" so the cause is diagnosable without serial.
 
 These mirror existing patterns: the activity is modelled on `FontDownloadActivity`
 (synchronous downloads with an input-pumping progress callback), the store mirrors
@@ -70,65 +78,61 @@ onEnter ─► checkConfigAndStart() ─► GoogleDriveStore::loadConfig()
   └─ Ready ───────────────────────────────► WIFI_SELECTION
                                                   │ (connected)
                                                   ▼
-                                            beginAuthOrSync()
-                         ┌────────────────────────┴───────────────┐
-              has refresh token?                          no refresh token
-                         │                                         │
-                 refreshAccessToken()                       AUTH_DEVICE_CODE
-                 ┌───────┴────────┐                  (show code+QR, poll token)
-              ok │            failed │                          │ success
-                 ▼                 ▼                            ▼
-              runSync()      start device flow ────────────► runSync()
-                 │
-                 ▼
-          LISTING ─► SYNCING ─► COMPLETE
-                 (any failure) ─► ERROR
+                                          authenticateAndSync()
+                                          ┌───────┴────────────────┐
+                                  AUTHENTICATING            (NTP sync the clock,
+                                          │                 GoogleJwtAuth::getAccessToken)
+                                  ┌───────┴────────┐
+                               ok │            failed │
+                                  ▼                 ▼
+                              runSync()           ERROR
+                                  │
+                                  ▼
+                          LISTING ─► SYNCING ─► COMPLETE
+                                 (any failure) ─► ERROR
 ```
 
 - **CONFIG_NEEDED** is a static instruction screen (config file missing or incomplete). The
   user edits `/.crosspoint/gdrive.json` on a PC and re-opens the menu item to re-read it;
   **Back** exits. The template is written only when the file is absent, so an edited file is
   never clobbered.
-- **AUTH_DEVICE_CODE** is the only interactive-while-networking state: `loop()` polls the
-  token endpoint at the server-provided interval (honoring `slow_down`) until the user
-  authorizes, the code expires, or the user presses Back.
+- **AUTHENTICATING** is non-interactive: it NTP-syncs the clock then mints a token (blocking,
+  a few seconds). No phone/code step. Failure routes to ERROR with the detailed reason.
 - **LISTING/SYNCING** are synchronous — the blocking network calls run on the main loop, and
   the download progress callback pumps `mappedInput.update()` + `requestUpdate()` so the
   screen stays live and **Back** cancels mid-download (same approach as `FontDownloadActivity`).
 - **onExit** calls `silentRestart()` when WiFi was brought up, to reclaim heap fragmentation
   from the TLS/WiFi session (consistent with the other network activities).
 
-## OAuth 2.0 device flow
+## Service-account authentication (JWT-bearer)
 
-Implemented in `GoogleDriveClient`. The OAuth client must be of type **TV and Limited Input**.
+Implemented in `src/network/GoogleJwtAuth.{h,cpp}` using the mbedTLS C API (already linked for
+TLS; SHA-256/base64 are also used by `FirmwareFlasher.cpp` / `ObfuscationUtils.cpp`).
 
-1. `requestDeviceCode(clientId)` → `POST https://oauth2.googleapis.com/device/code`
-   (`scope=drive.readonly`). Returns `device_code`, `user_code`, `verification_url`,
-   `interval`, `expires_in` into a fixed-buffer `DeviceCodeInfo` (no heap strings).
-2. `pollForToken(...)` → `POST https://oauth2.googleapis.com/token`
-   (`grant_type=urn:ietf:params:oauth:grant-type:device_code`). Returns a `PollStatus`:
-   `PENDING` / `SLOW_DOWN` keep polling, `SUCCESS` yields the **refresh token** (persisted)
-   + access token, and `DENIED`/`EXPIRED`/`ERROR` stop the flow.
-3. `refreshAccessToken(...)` → `POST .../token` (`grant_type=refresh_token`). Called at the
-   start of every sync; the access token is kept only in RAM.
+`GoogleJwtAuth::getAccessToken(clientEmail, privateKeyPem, tokenUri, scope, outToken)`:
 
-`HttpDownloader::postForm()` (added for this feature) issues the
-`application/x-www-form-urlencoded` POSTs and returns the body **and HTTP status for any
-status code** (`requireOk = false` internally), because the device flow signals "pending"
-and "slow down" through non-200 responses that carry an `error` field in the JSON.
+1. **Clock guard:** reject if `time(nullptr)` is implausibly small (clock not NTP-synced) —
+   otherwise Google rejects the JWT as `invalid_grant`. The activity NTP-syncs first.
+2. **Build & sign the JWT:** header `{"alg":"RS256","typ":"JWT"}` and claims
+   `{iss=clientEmail, scope=drive.readonly, aud=tokenUri, iat=now, exp=now+3600}`. base64url
+   both, join with `.`, SHA-256 the result (`mbedtls_sha256`), then sign with
+   `mbedtls_pk_sign(MBEDTLS_MD_SHA256)` after `mbedtls_pk_parse_key` on the PEM (RNG seeded via
+   entropy + ctr_drbg). The signature is base64url-appended → `header.claims.signature`.
+3. **Exchange:** `POST tokenUri` with
+   `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=<jwt>` via
+   `HttpDownloader::postForm`; read `access_token` from the JSON.
 
-### Security note: scope is account-wide
+base64url = `mbedtls_base64_encode` then `+`→`-`, `/`→`_`, strip `=`. `HttpDownloader::postForm()`
+returns the body **and HTTP status for any status code** (`requireOk = false`), so a non-200
+token error (`invalid_grant` etc.) is surfaced with Google's `error_description`.
 
-Google Drive has **no single-folder OAuth scope**. `drive.readonly` grants read access to the
-**entire** Drive of whatever account authorizes the device; the code only restricts to one
-folder by *convention* (the `q='<folderId>' in parents` query), not by a hard boundary. If the
-stored refresh token were extracted from the SD card, it could read that whole account.
+### Security note: access is folder-scoped
 
-**Recommended mitigation (documented for users, not enforced in code):** authorize against a
-**dedicated throwaway Google account** that only has the library folder shared into it, so a
-leaked token exposes nothing but books. (`drive.file` was rejected because it can't list a
-pre-existing shared folder without a browser Picker; an on-device service-account key would be
-worse to leak.)
+Unlike the rejected OAuth approaches, a **service account only sees what is explicitly shared
+with it** — it has its own empty Drive. The user shares just the books folder (Viewer), so the
+key on the SD card can read **only** that folder, never the user's wider Drive. The private key
+is obfuscated on disk (device-tied); if the card is lost, the user revokes the key in the Cloud
+console. This is the mitigation, enforced by Google's sharing model rather than by convention.
 
 ## Drive listing & download
 
@@ -165,47 +169,49 @@ records earned so far).
 
 ## On-disk format & config lifecycle: `/.crosspoint/gdrive.json`
 
-Configuration is **file-based** — the user edits this file on a PC rather than typing OAuth IDs
-on the device. `GoogleDriveStore` has three relevant entry points:
+Configuration is **file-based** — the user pastes Google's service-account JSON on a PC.
+`GoogleDriveStore` has three relevant entry points:
 
 - `writeConfigTemplate()` — writes an editable, pretty-printed template when no file exists:
 
   ```jsonc
   {
-    "_instructions": "Fill in clientId, clientSecret and folderId … (security warning)",
-    "clientId": "", "clientSecret": "", "folderId": "", "syncFolder": "/"
+    "_instructions": "Paste your Google service-account JSON … (folder-share note)",
+    "folderId": "", "syncFolder": "/",
+    "serviceAccount": { "client_email": "", "private_key": "", "token_uri": "https://oauth2.googleapis.com/token" }
   }
   ```
 
-  Note `clientSecret` here is a **plaintext** key — what the user pastes into.
+  `serviceAccount` mirrors Google's key-file shape, so the user can copy fields straight across.
+  `private_key` here is **plaintext** PEM (with `\n` escapes that ArduinoJson turns into real
+  newlines).
 
-- `loadConfig()` → `ConfigStatus { NoFile, Invalid, Incomplete, Ready }`. It reads the
-  obfuscated `clientSecret_obf` if present; otherwise it falls back to the plaintext
-  `clientSecret` key (the just-filled template) and flags a re-save. Returns `Incomplete` if any
-  of clientId/clientSecret/folderId is blank, `Invalid` on a JSON parse error (the file is **not**
-  overwritten in that case), else `Ready`.
+- `loadConfig()` → `ConfigStatus { NoFile, Invalid, Incomplete, Ready }`. It reads the obfuscated
+  `privateKey_obf` if present; otherwise it falls back to the plaintext
+  `serviceAccount.private_key` (the just-pasted key) and flags a re-save. Returns `Incomplete` if
+  any of client_email / private_key / folderId is blank, `Invalid` on a JSON parse error (the file
+  is **not** overwritten in that case), else `Ready`.
 
-- `saveToFile()` — writes the configured form, **never** plaintext secrets:
+- `saveToFile()` — writes the configured form, **never** the plaintext key:
 
   ```jsonc
   {
-    "_instructions":    "Configured. clientSecret and refreshToken are obfuscated …",
-    "clientId":         "….apps.googleusercontent.com", // plaintext
-    "folderId":         "1Ab…",                          // plaintext
-    "syncFolder":       "/",                             // SD destination, plaintext
-    "clientSecret_obf": "…",                             // obfuscated
-    "refreshToken_obf": "…",                             // obfuscated (set after OAuth)
+    "_instructions":  "Configured. The private key is obfuscated …",
+    "folderId":       "1Ab…",                              // plaintext
+    "syncFolder":     "/",                                 // SD destination, plaintext
+    "serviceAccount": { "client_email": "…@….iam.gserviceaccount.com", "token_uri": "…" },
+    "privateKey_obf": "…",                                 // obfuscated PEM
     "manifest": [ { "id": "<fileId>", "md5": "<32 hex>" }, … ]
   }
   ```
 
 The **plaintext→obfuscated migration** is the key behaviour: the first `loadConfig()` after the
-user fills in the template sees the plaintext `clientSecret`, returns `Ready`, and immediately
-calls `saveToFile()` — which writes `clientSecret_obf` and drops the plaintext key. Using two
-distinct keys (`clientSecret` vs `clientSecret_obf`) makes "is it obfuscated yet?" unambiguous.
+user pastes the key sees plaintext `serviceAccount.private_key`, returns `Ready`, and immediately
+calls `saveToFile()` — which writes `privateKey_obf` and drops the plaintext key. Using distinct
+keys (`serviceAccount.private_key` vs `privateKey_obf`) makes "is it obfuscated yet?" unambiguous.
 Obfuscation reuses `obfuscation::obfuscateToBase64`/`deobfuscateFromBase64`
 (`lib/Serialization/ObfuscationUtils.h`) — XOR with the device MAC then base64: not cryptographic,
-but ties secrets to the device and prevents casual reading off the card.
+but ties the key to the device and prevents casual reading off the card.
 
 ## Image optimization is out of scope
 
@@ -230,12 +236,15 @@ device code.
 
 ## Testing checklist (on device)
 
-1. Create an OAuth client (type **TV and Limited Input**, scope `drive.readonly`), ideally
-   under a dedicated books-only Google account with the library folder shared in.
-2. `Settings → System → Google Drive Sync` → enter Client ID / Secret / Folder ID once.
-3. Connect WiFi, complete the device-code flow on a phone; watch serial (`LOG_LEVEL=2`,
-   tag `GDRIVE`) for list/download/skip logs.
+1. Create a service account + JSON key, enable the Drive API, and **share the books folder with
+   the service account's `client_email`** (Viewer).
+2. Open Google Drive Sync once → edit `/.crosspoint/gdrive.json` on a PC: paste the JSON under
+   `serviceAccount` and set `folderId`. Re-open to obfuscate the key in place.
+3. Connect WiFi; watch serial (`LOG_LEVEL=2`, tags `GDRIVE`/`GJWT`) for the NTP sync, token
+   mint, and list/download/skip logs. Confirm no phone step is needed.
 4. Confirm books appear in the file browser and open/render.
 5. Re-run sync → already-present files are **skipped** (md5 match).
 6. Replace a file in Drive → next sync re-downloads only that file.
-7. Heap stays healthy across repeated syncs (`ESP.getFreeHeap()`), no leak.
+7. Failure paths: wrong/garbled key → `Authenticate: invalid private_key`; unshared folder →
+   `List folder: request failed`; both also land in `/.crosspoint/gdrive_log.txt`.
+8. Heap stays healthy across repeated syncs (`ESP.getFreeHeap()`), no leak.

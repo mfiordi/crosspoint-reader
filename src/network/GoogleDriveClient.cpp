@@ -13,8 +13,6 @@
 #include <cstring>
 
 namespace {
-constexpr const char* DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code";
-constexpr const char* TOKEN_URL = "https://oauth2.googleapis.com/token";
 constexpr const char* FILES_URL = "https://www.googleapis.com/drive/v3/files";
 // Listing pages are downloaded here before parsing, mirroring the font manifest
 // flow, so the TLS buffers and the full JSON are never held at once.
@@ -76,21 +74,6 @@ void copyStr(char* dst, size_t dstSize, const char* src) {
 bool isSupportedBook(std::string_view name) {
   return FsHelpers::hasEpubExtension(name) || FsHelpers::hasTxtExtension(name) || FsHelpers::hasXtcExtension(name);
 }
-
-// Pull Google's "error"/"error_description" out of a JSON error body, if any,
-// so the on-screen message names the actual cause (e.g. "invalid_client").
-std::string extractJsonError(const std::string& body) {
-  JsonDocument doc;
-  if (deserializeJson(doc, body)) return "";
-  const char* err = doc["error"] | "";
-  const char* desc = doc["error_description"] | "";
-  std::string out = err;
-  if (desc[0] != '\0') {
-    if (!out.empty()) out += ": ";
-    out += desc;
-  }
-  return out;
-}
 }  // namespace
 
 std::string GoogleDriveClient::lastError_;
@@ -106,147 +89,6 @@ void recordError(std::string& dest, const std::string& msg) {
   logToFile(msg.c_str());
 }
 }  // namespace
-
-bool GoogleDriveClient::requestDeviceCode(const std::string& clientId, DeviceCodeInfo& out) {
-  clearLastError();
-  const std::string body = "client_id=" + urlEncode(clientId) + "&scope=" + urlEncode(SCOPE);
-
-  std::string resp;
-  int status = 0;
-  if (!HttpDownloader::postForm(DEVICE_CODE_URL, body, resp, &status)) {
-    recordError(lastError_, "Get code: network/TLS failed (no internet, DNS, or captive portal?)");
-    return false;
-  }
-  if (status != 200) {
-    std::string detail = extractJsonError(resp);
-    std::string msg = "Get code: HTTP " + std::to_string(status);
-    if (status == 401 || status == 400) {
-      msg += " - check Client ID and that the OAuth client type is 'TV and Limited Input devices'";
-    } else if (status == 403) {
-      msg += " - check the Google Drive API is enabled for this project";
-    }
-    if (!detail.empty()) msg += " [" + detail + "]";
-    recordError(lastError_, msg);
-    return false;
-  }
-
-  JsonDocument doc;
-  if (deserializeJson(doc, resp)) {
-    recordError(lastError_, "Get code: could not parse Google's response");
-    return false;
-  }
-
-  copyStr(out.deviceCode, sizeof(out.deviceCode), doc["device_code"] | "");
-  copyStr(out.userCode, sizeof(out.userCode), doc["user_code"] | "");
-  // Google has used both "verification_url" (legacy) and "verification_uri".
-  const char* url = doc["verification_url"] | (doc["verification_uri"] | "");
-  copyStr(out.verificationUrl, sizeof(out.verificationUrl), url);
-  out.interval = doc["interval"] | 5;
-  out.expiresIn = doc["expires_in"] | 1800;
-
-  if (out.deviceCode[0] == '\0' || out.userCode[0] == '\0') {
-    recordError(lastError_, "Get code: response missing device_code/user_code");
-    return false;
-  }
-  logToFile("Get code: ok, waiting for authorization");
-  return true;
-}
-
-GoogleDriveClient::PollStatus GoogleDriveClient::pollForToken(const std::string& clientId,
-                                                              const std::string& clientSecret,
-                                                              const std::string& deviceCode,
-                                                              std::string& outRefreshToken,
-                                                              std::string& outAccessToken) {
-  const std::string body = "client_id=" + urlEncode(clientId) + "&client_secret=" + urlEncode(clientSecret) +
-                           "&device_code=" + urlEncode(deviceCode) +
-                           "&grant_type=" + urlEncode("urn:ietf:params:oauth:grant-type:device_code");
-
-  std::string resp;
-  int status = 0;
-  if (!HttpDownloader::postForm(TOKEN_URL, body, resp, &status)) {
-    recordError(lastError_, "Authorize: network/TLS failed while polling for token");
-    return PollStatus::ERROR;
-  }
-
-  JsonDocument doc;
-  if (deserializeJson(doc, resp)) {
-    recordError(lastError_, "Authorize: could not parse token response");
-    return PollStatus::ERROR;
-  }
-
-  if (status == 200) {
-    outAccessToken = doc["access_token"] | std::string("");
-    // refresh_token is only present on first authorization; preserve any prior
-    // value if the response omits it.
-    const std::string refresh = doc["refresh_token"] | std::string("");
-    if (!refresh.empty()) outRefreshToken = refresh;
-    if (outAccessToken.empty()) {
-      recordError(lastError_, "Authorize: token response missing access_token");
-      return PollStatus::ERROR;
-    }
-    logToFile("Authorize: ok, token received");
-    return PollStatus::SUCCESS;
-  }
-
-  const char* err = doc["error"] | "";
-  // These are expected, non-fatal poll states — don't treat as errors.
-  if (strcmp(err, "authorization_pending") == 0) return PollStatus::PENDING;
-  if (strcmp(err, "slow_down") == 0) return PollStatus::SLOW_DOWN;
-  if (strcmp(err, "access_denied") == 0) {
-    recordError(lastError_, "Authorize: access denied (approve on the phone with the account you set up)");
-    return PollStatus::DENIED;
-  }
-  if (strcmp(err, "expired_token") == 0) {
-    recordError(lastError_, "Authorize: the code expired before approval");
-    return PollStatus::EXPIRED;
-  }
-  {
-    std::string detail = extractJsonError(resp);
-    std::string msg = "Authorize: HTTP " + std::to_string(status);
-    if (detail.find("invalid_client") != std::string::npos)
-      msg += " - check the Client Secret";
-    else if (!detail.empty())
-      msg += " [" + detail + "]";
-    recordError(lastError_, msg);
-  }
-  return PollStatus::ERROR;
-}
-
-bool GoogleDriveClient::refreshAccessToken(const std::string& clientId, const std::string& clientSecret,
-                                           const std::string& refreshToken, std::string& outAccessToken) {
-  const std::string body = "client_id=" + urlEncode(clientId) + "&client_secret=" + urlEncode(clientSecret) +
-                           "&refresh_token=" + urlEncode(refreshToken) + "&grant_type=refresh_token";
-
-  std::string resp;
-  int status = 0;
-  if (!HttpDownloader::postForm(TOKEN_URL, body, resp, &status)) {
-    recordError(lastError_, "Refresh token: network/TLS failed");
-    return false;
-  }
-  if (status != 200) {
-    // A revoked/expired refresh token comes back as invalid_grant; the caller
-    // then falls back to a fresh device-code authorization.
-    std::string detail = extractJsonError(resp);
-    std::string msg = "Refresh token: HTTP " + std::to_string(status);
-    if (!detail.empty()) msg += " [" + detail + "]";
-    recordError(lastError_, msg);
-    return false;
-  }
-
-  JsonDocument doc;
-  if (deserializeJson(doc, resp)) {
-    recordError(lastError_, "Refresh token: could not parse response");
-    return false;
-  }
-
-  outAccessToken = doc["access_token"] | std::string("");
-  if (outAccessToken.empty()) {
-    recordError(lastError_, "Refresh token: response missing access_token");
-    return false;
-  }
-  logToFile("Refresh token: ok");
-  return true;
-}
 
 bool GoogleDriveClient::listFolder(const std::string& folderId, const std::string& accessToken,
                                    std::vector<DriveFile>& out) {
