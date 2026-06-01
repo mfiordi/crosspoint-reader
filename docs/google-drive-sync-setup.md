@@ -77,9 +77,10 @@ Do all of this **while signed in to your books-only Google account** (see the wa
 Typing long OAuth IDs on the e-ink keyboard is painful, so configuration is done by editing a
 small JSON file on the SD card from your PC.
 
-1. On the device: **Settings → System → Google Drive Sync**. The first time, it creates the
-   file `/.crosspoint/gdrive.json` on the SD card and shows *"Config file created — edit
-   /.crosspoint/gdrive.json on your PC, then run again."* Press **Back**.
+1. On the device, open **Google Drive Sync** — it's in two places: **Home → File Transfer →
+   Google Drive Sync** (quicker), or **Settings → System → Google Drive Sync**. The first time,
+   it creates the file `/.crosspoint/gdrive.json` on the SD card and shows *"Config file
+   created — edit /.crosspoint/gdrive.json on your PC, then run again."* Press **Back**.
 2. Power off the device, take out the SD card, and put it in your PC.
 3. Open **`/.crosspoint/gdrive.json`** in any text editor. It looks like this:
 
@@ -117,6 +118,11 @@ downloads books that are new or changed. No editing or re-authorizing needed.
 
 ## Notes & troubleshooting
 
+- **The on-screen error tells you the cause.** Instead of a generic message, the device shows
+  the failing step and reason — e.g. *"Get code: HTTP 401 — check Client ID and that the OAuth
+  client type is 'TV and Limited Input devices'"* or *"Authorize: HTTP 401 — check the Client
+  Secret"*. The same messages are appended to **`/.crosspoint/gdrive_log.txt`** on the SD card,
+  so you can read the history on your PC.
 - **Books are downloaded as-is.** The device does not shrink or convert images during sync, so
   put already-optimized books in the folder. (You can optimize them with the device's web
   uploader before placing them in Drive.)

@@ -35,8 +35,22 @@ optimize/transcode them (see [Image optimization is out of scope](#image-optimiz
 | `src/GoogleDriveStore.{h,cpp}` | Persistent config + dedup manifest (`/.crosspoint/gdrive.json`) |
 | `src/activities/network/GoogleDriveSyncActivity.{h,cpp}` | The UI/state-machine that drives the flow |
 | `src/network/HttpDownloader.{h,cpp}` | Shared HTTP client; extended here with `postForm()` + Bearer-token auth |
-| `src/activities/settings/SettingsActivity.{h,cpp}` | Menu entry + action dispatch (`SettingAction::GoogleDriveSync`) |
+| `src/activities/settings/SettingsActivity.{h,cpp}` | Settings entry point (`SettingAction::GoogleDriveSync`) |
+| `src/activities/network/NetworkModeSelectionActivity.{h,cpp}` | "File Transfer" entry point (`NetworkMode::GOOGLE_DRIVE_SYNC`) |
+| `src/activities/network/CrossPointWebServerActivity.cpp` | Launches the sync activity when that option is picked |
 | `lib/I18n/translations/english.yaml` | `STR_GDRIVE_*` / `STR_GOOGLE_DRIVE_SYNC` UI strings |
+
+**Two entry points:** *Settings → System → Google Drive Sync*, and *Home → File Transfer →
+Google Drive Sync* (the latter is the quicker path). Both launch the same
+`GoogleDriveSyncActivity`.
+
+### Diagnostics
+
+Failures are surfaced three ways: an on-screen message (word-wrapped), the serial log
+(`GDRIVE` tag), and an appended line in **`/.crosspoint/gdrive_log.txt`** on the SD card (kept
+under 32 KB). `GoogleDriveClient::lastError()` holds the detailed reason — failing step + HTTP
+status + Google's JSON `error`/`error_description` (e.g. `invalid_client`) — which the activity
+shows instead of the generic "Authorization failed" so the cause is diagnosable without serial.
 
 These mirror existing patterns: the activity is modelled on `FontDownloadActivity`
 (synchronous downloads with an input-pumping progress callback), the store mirrors

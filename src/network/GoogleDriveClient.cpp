@@ -1,11 +1,14 @@
 #include "GoogleDriveClient.h"
 
+#include <Arduino.h>
 #include <ArduinoJson.h>
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Logging.h>
 
 #include <cctype>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -16,8 +19,32 @@ constexpr const char* FILES_URL = "https://www.googleapis.com/drive/v3/files";
 // Listing pages are downloaded here before parsing, mirroring the font manifest
 // flow, so the TLS buffers and the full JSON are never held at once.
 constexpr const char* LIST_TMP = "/.crosspoint/gdrive_list.tmp";
+// Append-only diagnostic log; survives the silentRestart() on activity exit so
+// the user can read what happened on a PC. Trimmed if it grows too large.
+constexpr const char* LOG_FILE = "/.crosspoint/gdrive_log.txt";
+constexpr size_t LOG_MAX_BYTES = 32 * 1024;
 // Safety cap so a malformed nextPageToken loop can't run forever.
 constexpr int MAX_LIST_PAGES = 50;
+
+// Append one line to the SD log file (timestamped with millis since boot). Best
+// effort: never throws, never blocks the sync on failure.
+void logToFile(const char* line) {
+  Storage.mkdir("/.crosspoint");
+  // Keep the file bounded: if it got large, start fresh.
+  if (Storage.exists(LOG_FILE)) {
+    HalFile probe;
+    if (Storage.openFileForRead("GDRIVE", LOG_FILE, probe) && probe.fileSize() > LOG_MAX_BYTES) {
+      probe.close();
+      Storage.remove(LOG_FILE);
+    }
+  }
+  HalFile f = Storage.open(LOG_FILE, O_WRITE | O_CREAT | O_APPEND);
+  if (!f) return;
+  char buf[320];
+  const int n = snprintf(buf, sizeof(buf), "[%lu] %s\n", static_cast<unsigned long>(millis()), line);
+  if (n > 0) f.write(buf, static_cast<size_t>(n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1));
+  f.close();
+}
 
 // Percent-encode a value for a query string or form body (RFC 3986 unreserved
 // set passes through). grant_type and the folder query contain ':' '/' and
@@ -49,25 +76,63 @@ void copyStr(char* dst, size_t dstSize, const char* src) {
 bool isSupportedBook(std::string_view name) {
   return FsHelpers::hasEpubExtension(name) || FsHelpers::hasTxtExtension(name) || FsHelpers::hasXtcExtension(name);
 }
+
+// Pull Google's "error"/"error_description" out of a JSON error body, if any,
+// so the on-screen message names the actual cause (e.g. "invalid_client").
+std::string extractJsonError(const std::string& body) {
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) return "";
+  const char* err = doc["error"] | "";
+  const char* desc = doc["error_description"] | "";
+  std::string out = err;
+  if (desc[0] != '\0') {
+    if (!out.empty()) out += ": ";
+    out += desc;
+  }
+  return out;
+}
+}  // namespace
+
+std::string GoogleDriveClient::lastError_;
+
+namespace {
+// Record a failure: store it for the UI (GoogleDriveClient::lastError_, via the
+// setter below), mirror it to the serial log, and append it to the SD log file.
+// Defined as a free function so the anonymous-namespace logToFile is visible;
+// the member setter forwards here.
+void recordError(std::string& dest, const std::string& msg) {
+  dest = msg;
+  LOG_ERR("GDRIVE", "%s", msg.c_str());
+  logToFile(msg.c_str());
+}
 }  // namespace
 
 bool GoogleDriveClient::requestDeviceCode(const std::string& clientId, DeviceCodeInfo& out) {
+  clearLastError();
   const std::string body = "client_id=" + urlEncode(clientId) + "&scope=" + urlEncode(SCOPE);
 
   std::string resp;
   int status = 0;
   if (!HttpDownloader::postForm(DEVICE_CODE_URL, body, resp, &status)) {
-    LOG_ERR("GDRIVE", "device/code request failed");
+    recordError(lastError_, "Get code: network/TLS failed (no internet, DNS, or captive portal?)");
     return false;
   }
   if (status != 200) {
-    LOG_ERR("GDRIVE", "device/code status %d", status);
+    std::string detail = extractJsonError(resp);
+    std::string msg = "Get code: HTTP " + std::to_string(status);
+    if (status == 401 || status == 400) {
+      msg += " - check Client ID and that the OAuth client type is 'TV and Limited Input devices'";
+    } else if (status == 403) {
+      msg += " - check the Google Drive API is enabled for this project";
+    }
+    if (!detail.empty()) msg += " [" + detail + "]";
+    recordError(lastError_, msg);
     return false;
   }
 
   JsonDocument doc;
   if (deserializeJson(doc, resp)) {
-    LOG_ERR("GDRIVE", "device/code parse error");
+    recordError(lastError_, "Get code: could not parse Google's response");
     return false;
   }
 
@@ -80,9 +145,10 @@ bool GoogleDriveClient::requestDeviceCode(const std::string& clientId, DeviceCod
   out.expiresIn = doc["expires_in"] | 1800;
 
   if (out.deviceCode[0] == '\0' || out.userCode[0] == '\0') {
-    LOG_ERR("GDRIVE", "device/code response missing fields");
+    recordError(lastError_, "Get code: response missing device_code/user_code");
     return false;
   }
+  logToFile("Get code: ok, waiting for authorization");
   return true;
 }
 
@@ -98,13 +164,13 @@ GoogleDriveClient::PollStatus GoogleDriveClient::pollForToken(const std::string&
   std::string resp;
   int status = 0;
   if (!HttpDownloader::postForm(TOKEN_URL, body, resp, &status)) {
-    LOG_ERR("GDRIVE", "token poll request failed");
+    recordError(lastError_, "Authorize: network/TLS failed while polling for token");
     return PollStatus::ERROR;
   }
 
   JsonDocument doc;
   if (deserializeJson(doc, resp)) {
-    LOG_ERR("GDRIVE", "token poll parse error");
+    recordError(lastError_, "Authorize: could not parse token response");
     return PollStatus::ERROR;
   }
 
@@ -115,18 +181,34 @@ GoogleDriveClient::PollStatus GoogleDriveClient::pollForToken(const std::string&
     const std::string refresh = doc["refresh_token"] | std::string("");
     if (!refresh.empty()) outRefreshToken = refresh;
     if (outAccessToken.empty()) {
-      LOG_ERR("GDRIVE", "token response missing access_token");
+      recordError(lastError_, "Authorize: token response missing access_token");
       return PollStatus::ERROR;
     }
+    logToFile("Authorize: ok, token received");
     return PollStatus::SUCCESS;
   }
 
   const char* err = doc["error"] | "";
+  // These are expected, non-fatal poll states — don't treat as errors.
   if (strcmp(err, "authorization_pending") == 0) return PollStatus::PENDING;
   if (strcmp(err, "slow_down") == 0) return PollStatus::SLOW_DOWN;
-  if (strcmp(err, "access_denied") == 0) return PollStatus::DENIED;
-  if (strcmp(err, "expired_token") == 0) return PollStatus::EXPIRED;
-  LOG_ERR("GDRIVE", "token poll error: %s (status %d)", err, status);
+  if (strcmp(err, "access_denied") == 0) {
+    recordError(lastError_, "Authorize: access denied (approve on the phone with the account you set up)");
+    return PollStatus::DENIED;
+  }
+  if (strcmp(err, "expired_token") == 0) {
+    recordError(lastError_, "Authorize: the code expired before approval");
+    return PollStatus::EXPIRED;
+  }
+  {
+    std::string detail = extractJsonError(resp);
+    std::string msg = "Authorize: HTTP " + std::to_string(status);
+    if (detail.find("invalid_client") != std::string::npos)
+      msg += " - check the Client Secret";
+    else if (!detail.empty())
+      msg += " [" + detail + "]";
+    recordError(lastError_, msg);
+  }
   return PollStatus::ERROR;
 }
 
@@ -138,25 +220,31 @@ bool GoogleDriveClient::refreshAccessToken(const std::string& clientId, const st
   std::string resp;
   int status = 0;
   if (!HttpDownloader::postForm(TOKEN_URL, body, resp, &status)) {
-    LOG_ERR("GDRIVE", "token refresh request failed");
+    recordError(lastError_, "Refresh token: network/TLS failed");
     return false;
   }
   if (status != 200) {
-    LOG_ERR("GDRIVE", "token refresh status %d", status);
+    // A revoked/expired refresh token comes back as invalid_grant; the caller
+    // then falls back to a fresh device-code authorization.
+    std::string detail = extractJsonError(resp);
+    std::string msg = "Refresh token: HTTP " + std::to_string(status);
+    if (!detail.empty()) msg += " [" + detail + "]";
+    recordError(lastError_, msg);
     return false;
   }
 
   JsonDocument doc;
   if (deserializeJson(doc, resp)) {
-    LOG_ERR("GDRIVE", "token refresh parse error");
+    recordError(lastError_, "Refresh token: could not parse response");
     return false;
   }
 
   outAccessToken = doc["access_token"] | std::string("");
   if (outAccessToken.empty()) {
-    LOG_ERR("GDRIVE", "token refresh missing access_token");
+    recordError(lastError_, "Refresh token: response missing access_token");
     return false;
   }
+  logToFile("Refresh token: ok");
   return true;
 }
 
@@ -177,14 +265,14 @@ bool GoogleDriveClient::listFolder(const std::string& folderId, const std::strin
     const auto dl =
         HttpDownloader::downloadToFile(url, LIST_TMP, nullptr, nullptr, /*username=*/"", /*password=*/"", accessToken);
     if (dl != HttpDownloader::OK) {
-      LOG_ERR("GDRIVE", "folder listing fetch failed (%d)", dl);
+      recordError(lastError_, "List folder: request failed - check the Folder ID and that the account can see it");
       Storage.remove(LIST_TMP);
       return false;
     }
 
     HalFile file;
     if (!Storage.openFileForRead("GDRIVE", LIST_TMP, file)) {
-      LOG_ERR("GDRIVE", "failed to open listing temp file");
+      recordError(lastError_, "List folder: could not read the downloaded listing from SD");
       Storage.remove(LIST_TMP);
       return false;
     }
@@ -203,7 +291,7 @@ bool GoogleDriveClient::listFolder(const std::string& folderId, const std::strin
     file.close();
     Storage.remove(LIST_TMP);
     if (err) {
-      LOG_ERR("GDRIVE", "listing parse error: %s", err.c_str());
+      recordError(lastError_, std::string("List folder: could not parse listing (") + err.c_str() + ")");
       return false;
     }
 
@@ -226,6 +314,9 @@ bool GoogleDriveClient::listFolder(const std::string& folderId, const std::strin
     if (pageToken.empty()) break;
   }
 
+  char line[64];
+  snprintf(line, sizeof(line), "List folder: ok, %u book(s)", static_cast<unsigned>(out.size()));
+  logToFile(line);
   LOG_DBG("GDRIVE", "listed %zu book file(s)", out.size());
   return true;
 }

@@ -78,4 +78,15 @@ class GoogleDriveClient {
                                                     const std::string& destPath,
                                                     HttpDownloader::ProgressCallback progress = nullptr,
                                                     bool* cancelFlag = nullptr);
+
+  // --- Diagnostics ---
+
+  // Human-readable detail for the most recent failure (failing step + HTTP
+  // status + Google's JSON error, when available). Empty until something fails.
+  // The activity shows this on screen so the user can diagnose without serial.
+  static const std::string& lastError() { return lastError_; }
+  static void clearLastError() { lastError_.clear(); }
+
+ private:
+  static std::string lastError_;
 };

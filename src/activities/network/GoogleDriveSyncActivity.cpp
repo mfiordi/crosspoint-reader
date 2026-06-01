@@ -114,7 +114,7 @@ void GoogleDriveSyncActivity::startDeviceAuth() {
   if (!GoogleDriveClient::requestDeviceCode(GDRIVE_STORE.getClientId(), deviceCode_)) {
     RenderLock lock(*this);
     state_ = ERROR;
-    errorMessage_ = tr(STR_GDRIVE_AUTH_FAILED);
+    errorMessage_ = detailOr(tr(STR_GDRIVE_AUTH_FAILED));
     return;
   }
 
@@ -150,20 +150,20 @@ void GoogleDriveSyncActivity::pollAuth() {
     case GoogleDriveClient::PollStatus::DENIED: {
       RenderLock lock(*this);
       state_ = ERROR;
-      errorMessage_ = tr(STR_GDRIVE_ACCESS_DENIED);
+      errorMessage_ = detailOr(tr(STR_GDRIVE_ACCESS_DENIED));
       return;
     }
     case GoogleDriveClient::PollStatus::EXPIRED: {
       RenderLock lock(*this);
       state_ = ERROR;
-      errorMessage_ = tr(STR_GDRIVE_CODE_EXPIRED);
+      errorMessage_ = detailOr(tr(STR_GDRIVE_CODE_EXPIRED));
       return;
     }
     case GoogleDriveClient::PollStatus::ERROR:
     default: {
       RenderLock lock(*this);
       state_ = ERROR;
-      errorMessage_ = tr(STR_GDRIVE_AUTH_FAILED);
+      errorMessage_ = detailOr(tr(STR_GDRIVE_AUTH_FAILED));
       return;
     }
   }
@@ -180,7 +180,7 @@ void GoogleDriveSyncActivity::runSync() {
   if (!GoogleDriveClient::listFolder(GDRIVE_STORE.getFolderId(), accessToken_, files_)) {
     RenderLock lock(*this);
     state_ = ERROR;
-    errorMessage_ = tr(STR_GDRIVE_LIST_FAILED);
+    errorMessage_ = detailOr(tr(STR_GDRIVE_LIST_FAILED));
     return;
   }
 
@@ -266,6 +266,11 @@ std::string GoogleDriveSyncActivity::destPathFor(const char* fileName) const {
   return folder;
 }
 
+std::string GoogleDriveSyncActivity::detailOr(const char* fallback) {
+  const std::string& detail = GoogleDriveClient::lastError();
+  return detail.empty() ? std::string(fallback) : detail;
+}
+
 std::string GoogleDriveSyncActivity::formatSize(size_t bytes) {
   char buf[32];
   if (bytes >= 1024 * 1024) {
@@ -333,9 +338,22 @@ void GoogleDriveSyncActivity::render(RenderLock&&) {
   renderer.clearScreen();
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_GOOGLE_DRIVE_SYNC));
 
+  // Word-wrap long detail text (error reasons, file names, hints) across the
+  // content width and draw it centered starting at y. Returns the y below the
+  // last line drawn. drawCenteredText alone clips anything wider than the
+  // screen, so anything user/server-supplied must go through here.
+  const int contentWidth = pageWidth - metrics.contentSidePadding * 2;
+  auto drawWrappedCentered = [&](int y, const char* text, int maxLines, EpdFontFamily::Style style) -> int {
+    for (const auto& wline : renderer.wrappedText(UI_10_FONT_ID, text, contentWidth, maxLines, style)) {
+      renderer.drawCenteredText(UI_10_FONT_ID, y, wline.c_str(), true, style);
+      y += lineHeight;
+    }
+    return y;
+  };
+
   if (state_ == CONFIG_NEEDED) {
-    renderer.drawCenteredText(UI_10_FONT_ID, centerY - lineHeight, configMessage_.c_str(), true, EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, centerY + metrics.verticalSpacing, tr(STR_GDRIVE_CONFIG_EDIT_HINT));
+    int y = drawWrappedCentered(centerY - lineHeight * 2, configMessage_.c_str(), 2, EpdFontFamily::BOLD);
+    drawWrappedCentered(y + metrics.verticalSpacing, tr(STR_GDRIVE_CONFIG_EDIT_HINT), 3, EpdFontFamily::REGULAR);
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else if (state_ == AUTH_DEVICE_CODE) {
@@ -362,7 +380,8 @@ void GoogleDriveSyncActivity::render(RenderLock&&) {
                              std::to_string(files_.size()) + ")";
     renderer.drawCenteredText(UI_10_FONT_ID, centerY - lineHeight * 2, statusText.c_str());
     if (!currentFileName_.empty()) {
-      renderer.drawCenteredText(UI_10_FONT_ID, centerY - lineHeight, currentFileName_.c_str());
+      // File names can be long; wrap to a single ellipsized line so it fits.
+      drawWrappedCentered(centerY - lineHeight, currentFileName_.c_str(), 1, EpdFontFamily::REGULAR);
     }
 
     float progress = fileTotal_ > 0 ? static_cast<float>(fileProgress_) / static_cast<float>(fileTotal_) : 0.0f;
@@ -389,10 +408,12 @@ void GoogleDriveSyncActivity::render(RenderLock&&) {
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else if (state_ == ERROR) {
-    renderer.drawCenteredText(UI_10_FONT_ID, centerY - lineHeight, tr(STR_GDRIVE_SYNC_FAILED), true,
+    // Put the (possibly long) detail above the title so wrapping has room to
+    // grow downward toward the button hints without overrunning them.
+    renderer.drawCenteredText(UI_10_FONT_ID, centerY - lineHeight * 2, tr(STR_GDRIVE_SYNC_FAILED), true,
                               EpdFontFamily::BOLD);
     if (!errorMessage_.empty()) {
-      renderer.drawCenteredText(UI_10_FONT_ID, centerY + metrics.verticalSpacing, errorMessage_.c_str());
+      drawWrappedCentered(centerY, errorMessage_.c_str(), 5, EpdFontFamily::REGULAR);
     }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_RETRY), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
