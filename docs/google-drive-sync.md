@@ -22,6 +22,10 @@ The device **only reads** from Drive (scope `drive.readonly`) and **only downloa
 it never writes, deletes, or uploads. Books are pulled **as-is**; the device does not
 optimize/transcode them (see [Image optimization is out of scope](#image-optimization-is-out-of-scope)).
 
+> **Setting it up?** End-user steps for creating the OAuth credentials and finding the Folder
+> ID are in [google-drive-sync-setup.md](google-drive-sync-setup.md). This document is the
+> developer/architecture reference.
+
 ## Components
 
 | File | Role |
