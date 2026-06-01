@@ -38,18 +38,30 @@ bool isRedirect(int status) {
   return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
 }
 
-// Streams a GET body through sink.write in READ_CHUNK pieces. Uses the manual
-// open/fetch_headers/read path rather than esp_http_client_perform(): perform()
-// pushes the whole body through an event callback and reports a chunked body
-// that ends early as ESP_ERR_HTTP_INCOMPLETE_DATA, whereas the read loop streams
-// large/slow files and surfaces a short read directly.
-HttpDownloader::DownloadError runGet(const std::string& url, const std::string& username, const std::string& password,
-                                     Sink& sink) {
+// Options for a single request. The defaults reproduce the original GET
+// behaviour, so existing callers are unaffected.
+struct RequestOptions {
+  esp_http_client_method_t method = HTTP_METHOD_GET;
+  const std::string* postBody = nullptr;  // form-encoded body when method is POST
+  std::string bearer;                     // sends "Authorization: Bearer <token>" when set
+  std::string username;                   // Basic auth (ignored when bearer is set)
+  std::string password;
+  bool requireOk = true;  // when false, stream the body for any status (so the caller sees error JSON)
+  int* outStatus = nullptr;
+};
+
+// Streams a response body through sink.write in READ_CHUNK pieces. Uses the
+// manual open/fetch_headers/read path rather than esp_http_client_perform():
+// perform() pushes the whole body through an event callback and reports a
+// chunked body that ends early as ESP_ERR_HTTP_INCOMPLETE_DATA, whereas the
+// read loop streams large/slow files and surfaces a short read directly.
+HttpDownloader::DownloadError runRequest(const std::string& url, const RequestOptions& opt, Sink& sink) {
   esp_http_client_config_t config = {};
   config.url = url.c_str();
   config.buffer_size = HTTP_RX_BUF;
   config.buffer_size_tx = HTTP_TX_BUF;
   config.timeout_ms = HTTP_TIMEOUT_MS;
+  config.method = opt.method;
   // Verify HTTPS against the bundled CA roots. This build has esp-tls
   // CONFIG_ESP_TLS_INSECURE off, so an unverified TLS handshake can't be set
   // up at all; the model is public servers over verified https and local
@@ -66,25 +78,43 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
   }
 
   esp_http_client_set_header(client, "User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
-  if (!username.empty() && !password.empty()) {
+  if (!opt.bearer.empty()) {
+    // OAuth 2.0 bearer token (Google Drive). Takes precedence over Basic auth.
+    const std::string header = "Bearer " + opt.bearer;
+    esp_http_client_set_header(client, "Authorization", header.c_str());
+  } else if (!opt.username.empty() && !opt.password.empty()) {
     // Preemptive Basic auth, like the prior addHeader; don't wait for a 401.
-    const std::string credentials = username + ":" + password;
+    const std::string credentials = opt.username + ":" + opt.password;
     const String header = "Basic " + base64::encode(credentials.c_str());
     esp_http_client_set_header(client, "Authorization", header.c_str());
   }
 
+  const size_t writeLen = opt.postBody ? opt.postBody->size() : 0;
+  if (opt.postBody) {
+    esp_http_client_set_header(client, "Content-Type", "application/x-www-form-urlencoded");
+  }
+
   // open()/read() does not auto-follow redirects (only perform() does), so step
   // 30x responses manually. OPDS download endpoints and the GitHub release CDN
-  // both redirect.
-  esp_err_t err = esp_http_client_open(client, 0);
+  // both redirect. POST endpoints here (Google OAuth) don't redirect, and
+  // re-opening would drop the body, so redirect-following is GET-only.
+  esp_err_t err = esp_http_client_open(client, writeLen);
   if (err != ESP_OK) {
     LOG_ERR("HTTP", "open failed: %s", esp_err_to_name(err));
     esp_http_client_cleanup(client);
     return HttpDownloader::HTTP_ERROR;
   }
+  if (opt.postBody && writeLen > 0) {
+    int written = esp_http_client_write(client, opt.postBody->data(), writeLen);
+    if (written < 0 || static_cast<size_t>(written) != writeLen) {
+      LOG_ERR("HTTP", "POST body write failed (%d of %u)", written, (unsigned)writeLen);
+      esp_http_client_cleanup(client);
+      return HttpDownloader::HTTP_ERROR;
+    }
+  }
   int64_t contentLength = esp_http_client_fetch_headers(client);
   int status = esp_http_client_get_status_code(client);
-  for (int hop = 0; isRedirect(status) && hop < 5; ++hop) {
+  for (int hop = 0; !opt.postBody && isRedirect(status) && hop < 5; ++hop) {
     if (esp_http_client_set_redirection(client) != ESP_OK) break;
     err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
@@ -96,7 +126,9 @@ HttpDownloader::DownloadError runGet(const std::string& url, const std::string& 
     status = esp_http_client_get_status_code(client);
   }
 
-  if (status != 200) {
+  if (opt.outStatus) *opt.outStatus = status;
+
+  if (opt.requireOk && status != 200) {
     LOG_ERR("HTTP", "unexpected status: %d", status);
     esp_http_client_cleanup(client);
     return HttpDownloader::HTTP_ERROR;
@@ -148,7 +180,10 @@ bool HttpDownloader::fetchUrl(const std::string& url, Stream& outContent, const 
   LOG_DBG("HTTP", "Fetching: %s", url.c_str());
   Sink sink;
   sink.write = [&outContent](const uint8_t* data, size_t len) { return outContent.write(data, len) == len; };
-  return runGet(url, username, password, sink) == OK;
+  RequestOptions opt;
+  opt.username = username;
+  opt.password = password;
+  return runRequest(url, opt, sink) == OK;
 }
 
 bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, const std::string& username,
@@ -160,7 +195,10 @@ bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, c
     outContent.append(reinterpret_cast<const char*>(data), len);
     return true;
   };
-  return runGet(url, username, password, sink) == OK;
+  RequestOptions opt;
+  opt.username = username;
+  opt.password = password;
+  return runRequest(url, opt, sink) == OK;
 }
 
 bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData, const std::string& username,
@@ -168,12 +206,36 @@ bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData
   LOG_DBG("HTTP", "Fetching: %s", url.c_str());
   Sink sink;
   sink.write = onData;
-  return runGet(url, username, password, sink) == OK;
+  RequestOptions opt;
+  opt.username = username;
+  opt.password = password;
+  return runRequest(url, opt, sink) == OK;
+}
+
+bool HttpDownloader::postForm(const std::string& url, const std::string& formBody, std::string& outResponse,
+                              int* outStatus, const std::string& bearer) {
+  LOG_DBG("HTTP", "POST: %s", url.c_str());
+  outResponse.clear();
+  Sink sink;
+  sink.write = [&outResponse](const uint8_t* data, size_t len) {
+    outResponse.append(reinterpret_cast<const char*>(data), len);
+    return true;
+  };
+  RequestOptions opt;
+  opt.method = HTTP_METHOD_POST;
+  opt.postBody = &formBody;
+  opt.bearer = bearer;
+  // Capture the body for any status: OAuth device-flow returns its "still
+  // pending" / "slow down" signals as error JSON with a non-200 status.
+  opt.requireOk = false;
+  opt.outStatus = outStatus;
+  return runRequest(url, opt, sink) == OK;
 }
 
 HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& url, const std::string& destPath,
                                                              ProgressCallback progress, bool* cancelFlag,
-                                                             const std::string& username, const std::string& password) {
+                                                             const std::string& username, const std::string& password,
+                                                             const std::string& bearer) {
   LOG_DBG("HTTP", "Downloading: %s -> %s", url.c_str(), destPath.c_str());
 
   if (Storage.exists(destPath.c_str())) {
@@ -190,7 +252,11 @@ HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& 
   sink.cancelFlag = cancelFlag;
   sink.write = [&file](const uint8_t* data, size_t len) { return file.write(data, len) == len; };
 
-  const DownloadError result = runGet(url, username, password, sink);
+  RequestOptions opt;
+  opt.username = username;
+  opt.password = password;
+  opt.bearer = bearer;
+  const DownloadError result = runRequest(url, opt, sink);
   // Close before any remove() on the same path; DESTRUCTOR_CLOSES_FILE would
   // otherwise close only after the remove.
   file.close();

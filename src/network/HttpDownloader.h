@@ -39,9 +39,24 @@ class HttpDownloader {
                        const std::string& password = "");
 
   /**
-   * Download a file to the SD card with optional credentials.
+   * Download a file to the SD card with optional credentials. When bearer is
+   * non-empty an "Authorization: Bearer <token>" header is sent instead of
+   * Basic auth (used for Google Drive's authenticated GET endpoints).
    */
   static DownloadError downloadToFile(const std::string& url, const std::string& destPath,
                                       ProgressCallback progress = nullptr, bool* cancelFlag = nullptr,
-                                      const std::string& username = "", const std::string& password = "");
+                                      const std::string& username = "", const std::string& password = "",
+                                      const std::string& bearer = "");
+
+  /**
+   * POST an application/x-www-form-urlencoded body and capture the response.
+   * Used for OAuth 2.0 device-flow endpoints (device/code, token). The full
+   * response body is returned in outResponse regardless of HTTP status, and the
+   * status code is written to *outStatus when provided, so the caller can tell a
+   * pending-authorization response (HTTP 428) from success (200) or a hard
+   * error. An optional Bearer token may be sent. Returns true when the HTTP
+   * exchange completed and a response was read.
+   */
+  static bool postForm(const std::string& url, const std::string& formBody, std::string& outResponse,
+                       int* outStatus = nullptr, const std::string& bearer = "");
 };

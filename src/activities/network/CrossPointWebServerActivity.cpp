@@ -14,6 +14,7 @@
 #include "SilentRestart.h"
 #include "WifiSelectionActivity.h"
 #include "activities/network/CalibreConnectActivity.h"
+#include "activities/network/GoogleDriveSyncActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/QrUtils.h"
@@ -110,6 +111,15 @@ void CrossPointWebServerActivity::onExit() {
 }
 
 void CrossPointWebServerActivity::onNetworkModeSelected(const NetworkMode mode) {
+  // Google Drive Sync is a self-contained flow (manages its own WiFi and reboots
+  // on exit), so hand off to it directly instead of starting the web server.
+  if (mode == NetworkMode::GOOGLE_DRIVE_SYNC) {
+    LOG_DBG("WEBACT", "Network mode selected: Google Drive Sync");
+    startActivityForResult(std::make_unique<GoogleDriveSyncActivity>(renderer, mappedInput),
+                           [this](const ActivityResult&) { onGoHome(); });
+    return;
+  }
+
   const char* modeName = "Join Network";
   if (mode == NetworkMode::CONNECT_CALIBRE) {
     modeName = "Connect to Calibre";
