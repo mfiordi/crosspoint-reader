@@ -12,6 +12,7 @@
 
 #include "CrossPointSettings.h"
 #include "FontInstaller.h"
+#include "GoogleDriveStore.h"
 #include "OpdsServerStore.h"
 #include "SdCardFontSystem.h"
 #include "SettingsList.h"
@@ -174,6 +175,11 @@ void CrossPointWebServer::begin() {
   server->on("/api/wifi", HTTP_GET, [this] { handleGetWifiNetworks(); });
   server->on("/api/wifi", HTTP_POST, [this] { handlePostWifiNetwork(); });
   server->on("/api/wifi/delete", HTTP_POST, [this] { handleDeleteWifiNetwork(); });
+
+  // Google Drive sync config endpoints (inbox/books folders are also the
+  // optimizer's source/destination, so the Files page reads them from here).
+  server->on("/api/gdrive", HTTP_GET, [this] { handleGetGoogleDrive(); });
+  server->on("/api/gdrive", HTTP_POST, [this] { handlePostGoogleDrive(); });
 
   server->onNotFound([this] { handleNotFound(); });
   LOG_DBG("WEB", "[MEM] Free heap after route setup: %d bytes", ESP.getFreeHeap());
@@ -1384,6 +1390,60 @@ void CrossPointWebServer::handleDeleteOpdsServer() {
 
   OPDS_STORE.removeServer(static_cast<size_t>(idx));
   LOG_DBG("WEB", "Deleted OPDS server at index %d", idx);
+  server->send(200, "text/plain", "OK");
+}
+
+// ---- Google Drive Sync config API ----
+
+void CrossPointWebServer::handleGetGoogleDrive() const {
+  // Make sure the in-memory store reflects what's on the card before reporting.
+  GDRIVE_STORE.loadConfig();
+
+  JsonDocument doc;
+  doc["clientEmail"] = GDRIVE_STORE.getClientEmail();
+  doc["tokenUri"] = GDRIVE_STORE.getTokenUri();
+  doc["folderId"] = GDRIVE_STORE.getFolderId();
+  doc["syncFolder"] = GDRIVE_STORE.getSyncFolder();
+  doc["booksFolder"] = GDRIVE_STORE.getBooksFolder();
+  // Never expose the private key — only whether one is stored.
+  doc["hasPrivateKey"] = !GDRIVE_STORE.getPrivateKey().empty();
+
+  String json;
+  serializeJson(doc, json);
+  server->send(200, "application/json", json);
+  LOG_DBG("WEB", "Served Google Drive config API");
+}
+
+void CrossPointWebServer::handlePostGoogleDrive() {
+  if (!server->hasArg("plain")) {
+    server->send(400, "text/plain", "Missing JSON body");
+    return;
+  }
+
+  const String body = server->arg("plain");
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    server->send(400, "text/plain", String("Invalid JSON: ") + err.c_str());
+    return;
+  }
+
+  // Load current state first so a partial form submit (e.g. blank key) preserves
+  // anything not being changed.
+  GDRIVE_STORE.loadConfig();
+
+  // privateKey is optional: empty/absent means "keep existing" (the GET never
+  // echoes the secret, so the form field is blank unless the user pastes a new
+  // key). updateConfig() applies this rule.
+  const std::string clientEmail = doc["clientEmail"] | std::string("");
+  const std::string privateKey = doc["privateKey"] | std::string("");
+  const std::string tokenUri = doc["tokenUri"] | std::string("");
+  const std::string folderId = doc["folderId"] | std::string("");
+  const std::string syncFolder = doc["syncFolder"] | std::string("");
+  const std::string booksFolder = doc["booksFolder"] | std::string("");
+
+  GDRIVE_STORE.updateConfig(clientEmail, privateKey, tokenUri, folderId, syncFolder, booksFolder);
+  LOG_DBG("WEB", "Updated Google Drive config");
   server->send(200, "text/plain", "OK");
 }
 

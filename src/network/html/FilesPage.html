@@ -1500,6 +1500,45 @@
   <button class="retry-all-btn" onclick="retryAllFailedUploads()">Retry All Failed Uploads</button>
 </div>
 
+<!-- Optimize Inbox panel: shown when the inbox folder holds un-optimized books -->
+<div class="card" id="inboxPanel" style="display:none; border-left:4px solid #9b59b6;">
+  <div class="contents-header">
+    <h2 class="contents-title">✨ Optimize Inbox</h2>
+    <span class="summary-inline" id="inboxSummary"></span>
+  </div>
+  <p style="color:#7f8c8d; margin:6px 0 12px;">
+    Books in <strong id="inboxFolderLabel"></strong> are optimized for e-ink and moved into
+    <strong id="booksFolderLabel"></strong>. A book whose name already exists in the library is
+    skipped and its inbox copy removed.
+  </p>
+
+  <details id="inboxSettings" style="margin-bottom:12px;">
+    <summary style="cursor:pointer; color:#9b59b6; font-weight:600;">⚙️ Optimization settings</summary>
+    <div style="margin-top:10px; display:flex; flex-wrap:wrap; gap:16px; align-items:center;">
+      <label>Quality:
+        <select id="inboxQuality" onchange="JPEG_QUALITY = parseInt(this.value, 10);">
+          <option value="85" selected>High (85%)</option>
+          <option value="70">Medium (70%)</option>
+          <option value="55">Low (55%)</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="inboxAutoCrop" onchange="ENABLE_AUTO_CROP = this.checked;"> Auto-crop margins</label>
+      <span style="color:#95a5a6;">Grayscale is always on for e-ink.</span>
+    </div>
+  </details>
+
+  <div id="inbox-progress-container" style="display:none; margin-bottom:12px;">
+    <div class="progress-bar" style="background:#ecf0f1; border-radius:6px; overflow:hidden; height:22px;">
+      <div id="inbox-progress-fill" style="width:0%; height:100%; background:#27ae60; transition:width .2s;"></div>
+    </div>
+    <p id="inbox-progress-text" style="margin:6px 0 0; color:#34495e;"></p>
+  </div>
+
+  <button class="action-btn" id="inboxOptimizeBtn" style="background:#9b59b6; color:#fff;" onclick="optimizeInbox()">
+    ✨ Optimize all
+  </button>
+</div>
+
 <div class="card">
   <div class="contents-header">
     <h2 class="contents-title">Contents</h2>
@@ -1976,6 +2015,9 @@
       fileTableContent += '</table>';
       fileTable.innerHTML = fileTableContent;
     }
+
+    // Refresh the "Optimize Inbox" panel once the listing is done.
+    loadInboxPanel();
   }
 
   // Modal functions
@@ -4890,7 +4932,8 @@ function getWsUrl() {
 }
 
 // Upload file via WebSocket (faster, binary protocol)
-function uploadFileWebSocket(file, onProgress, onComplete, onError) {
+function uploadFileWebSocket(file, onProgress, onComplete, onError, destPath) {
+  const targetPath = destPath || currentPath;
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(getWsUrl());
     currentUploadWs = ws;
@@ -4903,7 +4946,7 @@ function uploadFileWebSocket(file, onProgress, onComplete, onError) {
     ws.onopen = function() {
       console.log('[WS] Connected, starting upload:', file.name);
       // Send start message: START:<filename>:<size>:<path>
-      ws.send(`START:${file.name}:${file.size}:${currentPath}`);
+      ws.send(`START:${file.name}:${file.size}:${targetPath}`);
     };
 
     ws.onmessage = async function(event) {
@@ -4999,14 +5042,15 @@ function uploadFileWebSocket(file, onProgress, onComplete, onError) {
 }
 
 // Upload file via HTTP (fallback method)
-function uploadFileHTTP(file, onProgress, onComplete, onError) {
+function uploadFileHTTP(file, onProgress, onComplete, onError, destPath) {
+  const targetPath = destPath || currentPath;
   return new Promise((resolve, reject) => {
     const formData = new FormData();
     formData.append('file', file);
 
     const xhr = new XMLHttpRequest();
     currentUploadXhr = xhr;
-    xhr.open('POST', '/upload?path=' + encodeURIComponent(currentPath), true);
+    xhr.open('POST', '/upload?path=' + encodeURIComponent(targetPath), true);
 
     xhr.upload.onprogress = function(e) {
       if (e.lengthComputable && onProgress) {
@@ -5294,6 +5338,182 @@ function uploadFile() {
   }
 
   uploadNextFile();
+}
+
+// ---- Optimize Inbox: un-optimized books -> Books library ----
+
+let inboxConfig = { inbox: '', books: '' };
+
+function inboxJoinPath(folder, name) {
+  if (!folder || folder === '/') return '/' + name;
+  return folder.endsWith('/') ? folder + name : folder + '/' + name;
+}
+
+// mkdir for the destination library. Idempotent enough: a failure (already
+// exists) is non-fatal — a real problem surfaces on the subsequent upload.
+async function ensureFolder(folderPath) {
+  if (!folderPath || folderPath === '/') return;
+  const trimmed = folderPath.replace(/\/+$/, '');
+  const slash = trimmed.lastIndexOf('/');
+  const parent = slash <= 0 ? '/' : trimmed.substring(0, slash);
+  const name = trimmed.substring(slash + 1);
+  if (!name) return;
+  try {
+    const fd = new FormData();
+    fd.append('name', name);
+    fd.append('path', parent);
+    await fetch('/mkdir', { method: 'POST', body: fd });
+  } catch (e) { /* non-fatal */ }
+}
+
+async function listEpubsInFolder(folderPath) {
+  const res = await fetch('/api/files?path=' + encodeURIComponent(folderPath) + '&_=' + Date.now());
+  if (!res.ok) return [];
+  const items = await res.json();
+  return items.filter(it => !it.isDirectory && (it.isEpub || it.name.toLowerCase().endsWith('.epub')));
+}
+
+function deletePaths(paths) {
+  const norm = paths.map(p => (p.startsWith('/') ? p : '/' + p));
+  return fetch('/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'paths=' + encodeURIComponent(JSON.stringify(norm))
+  }).then(res => { if (!res.ok) return res.text().then(t => { throw new Error(t || 'delete failed'); }); });
+}
+
+// Populate the Optimize Inbox panel; hide it when there's nothing pending.
+async function loadInboxPanel() {
+  const panel = document.getElementById('inboxPanel');
+  if (!panel) return;
+
+  try {
+    const res = await fetch('/api/gdrive?_=' + Date.now());
+    if (!res.ok) { panel.style.display = 'none'; return; }
+    const cfg = await res.json();
+    inboxConfig.inbox = cfg.syncFolder || '/Inbox';
+    inboxConfig.books = cfg.booksFolder || '/Books';
+  } catch (e) { panel.style.display = 'none'; return; }
+
+  let pending;
+  try {
+    pending = await listEpubsInFolder(inboxConfig.inbox);
+  } catch (e) { panel.style.display = 'none'; return; }
+
+  if (!pending || pending.length === 0) { panel.style.display = 'none'; return; }
+
+  document.getElementById('inboxFolderLabel').textContent = inboxConfig.inbox;
+  document.getElementById('booksFolderLabel').textContent = inboxConfig.books;
+  const totalBytes = pending.reduce((s, f) => s + (f.size || 0), 0);
+  document.getElementById('inboxSummary').textContent =
+    pending.length + ' book' + (pending.length === 1 ? '' : 's') + ' · ' + formatFileSize(totalBytes);
+  panel.style.display = '';
+}
+
+async function optimizeInbox() {
+  const btn = document.getElementById('inboxOptimizeBtn');
+  if (isUploadInProgress) { alert('Another transfer is in progress.'); return; }
+
+  const inbox = inboxConfig.inbox || '/Inbox';
+  const books = inboxConfig.books || '/Books';
+  if (inbox === books) {
+    alert('Inbox and Books folders are the same. Set different folders under Settings → Google Drive.');
+    return;
+  }
+
+  let pending, existing;
+  try {
+    pending = await listEpubsInFolder(inbox);
+    existing = await listEpubsInFolder(books);
+  } catch (e) {
+    alert('Could not read folders: ' + e.message);
+    return;
+  }
+  if (!pending.length) { showNotification('Inbox is empty.', 'info'); loadInboxPanel(); return; }
+
+  const existingNames = new Set(existing.map(f => f.name.toLowerCase()));
+
+  isUploadInProgress = true;
+  uploadGeneration++;
+  btn.disabled = true;
+
+  await ensureFolder(books);
+
+  const container = document.getElementById('inbox-progress-container');
+  const fill = document.getElementById('inbox-progress-fill');
+  const text = document.getElementById('inbox-progress-text');
+  container.style.display = 'block';
+
+  startBatchLog(pending.length);
+  showLog();
+
+  let optimized = 0, skipped = 0, failed = 0;
+  let useWebSocket = true;
+
+  for (let i = 0; i < pending.length; i++) {
+    const name = pending[i].name;
+    const srcPath = inboxJoinPath(inbox, name);
+    fill.style.width = Math.round((i / pending.length) * 100) + '%';
+    text.textContent = `(${i + 1}/${pending.length}) ${name}`;
+
+    // Already in the library: don't re-optimize, just clear the inbox copy.
+    if (existingNames.has(name.toLowerCase())) {
+      clearLog();
+      log(`<strong>${escapeHtml(name)}</strong> already in library — removing inbox copy`, 'warning', 'SKIP');
+      try { await deletePaths([srcPath]); } catch (e) { logError(`Could not delete ${name}: ${e.message}`); }
+      saveToFileBatchLog(name, true);
+      skipped++;
+      continue;
+    }
+
+    try {
+      // Pull the original off the device.
+      const res = await fetch('/download?path=' + encodeURIComponent(srcPath));
+      if (!res.ok) throw new Error('download failed (' + res.status + ')');
+      const srcBlob = await res.blob();
+      const srcFile = new File([srcBlob], name, { type: 'application/epub+zip' });
+
+      // Auto image handling for batch — no manual picker.
+      imageStates = {};
+      const convertedBlob = await convertEpubFile(srcFile, () => {});
+      const outFile = new File([convertedBlob], name, { type: 'application/epub+zip' });
+
+      // Upload optimized copy into the library (WS, fall back to HTTP).
+      try {
+        if (useWebSocket) {
+          await uploadFileWebSocket(outFile, null, null, null, books);
+        } else {
+          await uploadFileHTTP(outFile, null, null, null, books);
+        }
+      } catch (upErr) {
+        if (useWebSocket && upErr.message === 'WebSocket connection failed') {
+          useWebSocket = false;
+          await uploadFileHTTP(outFile, null, null, null, books);
+        } else {
+          throw upErr;
+        }
+      }
+
+      // Upload confirmed (DONE / HTTP 200) — only now is it safe to remove the
+      // inbox original.
+      await deletePaths([srcPath]);
+      saveToFileBatchLog(name, true, srcBlob.size, convertedBlob.size);
+      optimized++;
+    } catch (e) {
+      logError(`Failed to optimize ${name}: ${e.message}`);
+      saveToFileBatchLog(name, false);
+      failed++;
+    }
+  }
+
+  fill.style.width = '100%';
+  fill.style.backgroundColor = failed ? '#e67e22' : '#4caf50';
+  text.textContent = `Done — ${optimized} optimized, ${skipped} skipped, ${failed} failed`;
+  finalizeBatchLog();
+
+  isUploadInProgress = false;
+  btn.disabled = false;
+  setTimeout(() => { window.location.reload(); }, 2500);
 }
 
 function showFailedUploadsBanner() {

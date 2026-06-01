@@ -37,8 +37,10 @@ GoogleDriveStore::ConfigStatus GoogleDriveStore::loadConfig() {
   }
 
   folderId = doc["folderId"] | std::string("");
-  syncFolder = doc["syncFolder"] | std::string("/");
-  if (syncFolder.empty()) syncFolder = "/";
+  syncFolder = doc["syncFolder"] | std::string("/Inbox");
+  if (syncFolder.empty()) syncFolder = "/Inbox";
+  booksFolder = doc["booksFolder"] | std::string("/Books");
+  if (booksFolder.empty()) booksFolder = "/Books";
 
   // The user pastes Google's service-account JSON under "serviceAccount".
   JsonObject sa = doc["serviceAccount"].as<JsonObject>();
@@ -91,7 +93,8 @@ bool GoogleDriveStore::writeConfigTemplate() const {
   JsonDocument doc;
   doc["_instructions"] = TEMPLATE_INSTRUCTIONS;
   doc["folderId"] = "";
-  doc["syncFolder"] = "/";
+  doc["syncFolder"] = "/Inbox";
+  doc["booksFolder"] = "/Books";
   JsonObject sa = doc["serviceAccount"].to<JsonObject>();
   sa["client_email"] = "";
   sa["private_key"] = "";
@@ -109,6 +112,7 @@ bool GoogleDriveStore::saveToFile() const {
   doc["_instructions"] = CONFIGURED_NOTE;
   doc["folderId"] = folderId;
   doc["syncFolder"] = syncFolder;
+  doc["booksFolder"] = booksFolder;
   // Keep the non-secret service-account fields visible; the private key is
   // written only in obfuscated form (never plaintext).
   JsonObject sa = doc["serviceAccount"].to<JsonObject>();
@@ -143,4 +147,18 @@ void GoogleDriveStore::recordEntry(const std::string& fileId, const std::string&
     }
   }
   manifest.push_back({fileId, md5});
+}
+
+void GoogleDriveStore::updateConfig(const std::string& newClientEmail, const std::string& newPrivateKey,
+                                    const std::string& newTokenUri, const std::string& newFolderId,
+                                    const std::string& newSyncFolder, const std::string& newBooksFolder) {
+  clientEmail = newClientEmail;
+  // Empty key means "unchanged" — the web form never echoes the secret back, so
+  // a blank field must not clobber the stored key.
+  if (!newPrivateKey.empty()) privateKey = newPrivateKey;
+  tokenUri = newTokenUri.empty() ? std::string(DEFAULT_TOKEN_URI) : newTokenUri;
+  folderId = newFolderId;
+  syncFolder = newSyncFolder.empty() ? std::string("/Inbox") : newSyncFolder;
+  booksFolder = newBooksFolder.empty() ? std::string("/Books") : newBooksFolder;
+  saveToFile();
 }

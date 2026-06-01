@@ -302,6 +302,7 @@
 
   <div id="wifi-container"></div>
   <div id="opds-container"></div>
+  <div id="gdrive-container"></div>
 
   <div class="card">
     <p style="text-align: center; color: #95a5a6; margin: 0;">
@@ -809,8 +810,77 @@
     }
   }
 
+  // --- Google Drive Sync config ---
+  // Edits /.crosspoint/gdrive.json via /api/gdrive. The service-account private
+  // key is never returned by the GET; leave the field blank to keep the stored
+  // key. Inbox/Books folders double as the optimizer's source/destination.
+  let gdriveConfig = {};
+
+  function renderGoogleDriveSection() {
+    const container = document.getElementById('gdrive-container');
+    const c = gdriveConfig || {};
+    const keyPlaceholder = c.hasPrivateKey ? '(stored — leave blank to keep)' : 'Paste service-account private key (PEM)';
+    container.innerHTML =
+      '<div class="card"><h2>Google Drive Sync</h2>' +
+        '<div class="opds-server">' +
+          '<div class="setting-row"><span class="setting-label">Service account email</span>' +
+            '<span class="setting-control"><input type="text" id="gd-email" value="' + escapeHtml(c.clientEmail || '') + '" placeholder="name@project.iam.gserviceaccount.com"></span></div>' +
+          '<div class="setting-row"><span class="setting-label">Private key</span>' +
+            '<span class="setting-control"><textarea id="gd-key" rows="3" placeholder="' + keyPlaceholder + '"></textarea></span></div>' +
+          '<div class="setting-row"><span class="setting-label">Token URI</span>' +
+            '<span class="setting-control"><input type="text" id="gd-token" value="' + escapeHtml(c.tokenUri || 'https://oauth2.googleapis.com/token') + '"></span></div>' +
+          '<div class="setting-row"><span class="setting-label">Drive folder ID</span>' +
+            '<span class="setting-control"><input type="text" id="gd-folder" value="' + escapeHtml(c.folderId || '') + '"></span></div>' +
+          '<div class="setting-row"><span class="setting-label">Inbox folder (un-optimized)</span>' +
+            '<span class="setting-control"><input type="text" id="gd-inbox" value="' + escapeHtml(c.syncFolder || '/Inbox') + '"></span></div>' +
+          '<div class="setting-row"><span class="setting-label">Books folder (library)</span>' +
+            '<span class="setting-control"><input type="text" id="gd-books" value="' + escapeHtml(c.booksFolder || '/Books') + '"></span></div>' +
+          '<div class="opds-actions">' +
+            '<button class="btn-small btn-save-server" onclick="saveGoogleDrive()">Save</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+  }
+
+  async function loadGoogleDrive() {
+    try {
+      const resp = await fetch('/api/gdrive');
+      if (!resp.ok) throw new Error(await resp.text());
+      gdriveConfig = await resp.json();
+      renderGoogleDriveSection();
+    } catch (e) {
+      console.error('Google Drive load error:', e);
+    }
+  }
+
+  async function saveGoogleDrive() {
+    const payload = {
+      clientEmail: document.getElementById('gd-email').value,
+      tokenUri: document.getElementById('gd-token').value,
+      folderId: document.getElementById('gd-folder').value,
+      syncFolder: document.getElementById('gd-inbox').value,
+      booksFolder: document.getElementById('gd-books').value
+    };
+    // Only send the key when the user typed one — blank means "keep existing".
+    const key = document.getElementById('gd-key').value;
+    if (key && key.trim().length > 0) payload.privateKey = key;
+    try {
+      const resp = await fetch('/api/gdrive', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      showMessage('Google Drive settings saved!', false);
+      await loadGoogleDrive();
+    } catch (e) {
+      showMessage('Error: ' + e.message, true);
+    }
+  }
+
   loadWifiNetworks();
   loadOpdsServers();
+  loadGoogleDrive();
 </script>
 </body>
 </html>

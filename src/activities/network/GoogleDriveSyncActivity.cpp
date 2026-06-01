@@ -160,6 +160,18 @@ void GoogleDriveSyncActivity::runSync() {
     const auto& f = files_[i];
     const std::string destPath = destPathFor(f.name);
 
+    // Already-optimized: a book with this name already sits in the Books
+    // library, so it's been optimized on a previous run. Don't pull it back into
+    // the inbox. (booksFolder may equal syncFolder for users who skip the
+    // optimize step — guard against that so we don't skip everything.)
+    if (GDRIVE_STORE.getBooksFolder() != GDRIVE_STORE.getSyncFolder()) {
+      const std::string booksPath = booksPathFor(f.name);
+      if (Storage.exists(booksPath.c_str())) {
+        skippedCount_++;
+        continue;
+      }
+    }
+
     // Dedup: skip when we recorded this id with a matching md5 and the file is
     // still on the card. The md5 catches updated files; the existence check
     // catches manual deletion on the device.
@@ -221,6 +233,14 @@ void GoogleDriveSyncActivity::runSync() {
 
 std::string GoogleDriveSyncActivity::destPathFor(const char* fileName) const {
   std::string folder = GDRIVE_STORE.getSyncFolder();
+  if (folder.empty()) folder = "/";
+  if (folder.back() != '/') folder.push_back('/');
+  folder += fileName;
+  return folder;
+}
+
+std::string GoogleDriveSyncActivity::booksPathFor(const char* fileName) const {
+  std::string folder = GDRIVE_STORE.getBooksFolder();
   if (folder.empty()) folder = "/";
   if (folder.back() != '/') folder.push_back('/');
   folder += fileName;

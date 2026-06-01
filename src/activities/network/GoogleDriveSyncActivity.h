@@ -79,6 +79,7 @@ class GoogleDriveSyncActivity final : public Activity {
   void runSync();
 
   std::string destPathFor(const char* fileName) const;
+  std::string booksPathFor(const char* fileName) const;
   static std::string formatSize(size_t bytes);
 
   // Returns GoogleDriveClient's detailed last-error if present, else fallback.

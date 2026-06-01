@@ -139,4 +139,8 @@ class CrossPointWebServer {
   void handleGetWifiNetworks() const;
   void handlePostWifiNetwork();
   void handleDeleteWifiNetwork();
+
+  // Google Drive sync config handlers
+  void handleGetGoogleDrive() const;
+  void handlePostGoogleDrive();
 };

@@ -52,7 +52,19 @@ class GoogleDriveStore {
   const std::string& getPrivateKey() const { return privateKey; }
   const std::string& getTokenUri() const { return tokenUri; }
   const std::string& getFolderId() const { return folderId; }
+  // Inbox: where synced/un-optimized books land (also the optimizer source).
   const std::string& getSyncFolder() const { return syncFolder; }
+  // Books: the optimized library. Drive sync skips titles already here, and the
+  // web optimizer moves optimized EPUBs into it.
+  const std::string& getBooksFolder() const { return booksFolder; }
+
+  // --- Config mutators (used by the web settings endpoint) ---
+  // Update the editable config fields and persist. The private key is replaced
+  // only when newPrivateKey is non-empty (so a masked GET/POST round-trip never
+  // wipes it); a non-empty key is stored obfuscated by saveToFile().
+  void updateConfig(const std::string& newClientEmail, const std::string& newPrivateKey, const std::string& newTokenUri,
+                    const std::string& newFolderId, const std::string& newSyncFolder,
+                    const std::string& newBooksFolder);
 
   bool hasConfig() const { return !clientEmail.empty() && !privateKey.empty() && !folderId.empty(); }
 
@@ -71,7 +83,8 @@ class GoogleDriveStore {
   std::string privateKey;  // PEM, real newlines; obfuscated on disk
   std::string tokenUri = "https://oauth2.googleapis.com/token";
   std::string folderId;
-  std::string syncFolder = "/";
+  std::string syncFolder = "/Inbox";
+  std::string booksFolder = "/Books";
   std::vector<ManifestEntry> manifest;
 };
 

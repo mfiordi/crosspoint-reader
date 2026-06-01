@@ -14,11 +14,38 @@
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "GoogleDriveStore.h"
 #include "MappedInputManager.h"
 #include "OpdsServerStore.h"
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+
+namespace {
+// True if the inbox (Google Drive sync) folder holds at least one un-optimized
+// EPUB. Cheap directory listing — bails on the first match, skips dotfiles. Used
+// to decide whether to auto-launch the web optimizer on boot.
+bool inboxHasUnoptimizedBooks() {
+  // Pull the configured inbox path off the card; otherwise getSyncFolder() is
+  // just the in-memory default until something else loads the config this boot.
+  GDRIVE_STORE.loadConfig();
+  const std::string& inbox = GDRIVE_STORE.getSyncFolder();
+  if (inbox.empty()) return false;
+
+  HalFile dir = Storage.open(inbox.c_str());
+  if (!dir || !dir.isDirectory()) return false;
+
+  char nameBuf[256];
+  dir.rewindDirectory();
+  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
+    if (file.isDirectory()) continue;
+    file.getName(nameBuf, sizeof(nameBuf));
+    if (nameBuf[0] == '.') continue;  // skip hidden/system entries
+    if (FsHelpers::hasEpubExtension(std::string_view{nameBuf})) return true;
+  }
+  return false;
+}
+}  // namespace
 
 int HomeActivity::getMenuItemCount() const {
   int count = 4;  // File Browser, Recents, File transfer, Settings
@@ -110,6 +137,21 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
 
 void HomeActivity::onEnter() {
   Activity::onEnter();
+
+  // Auto-launch the web optimizer when the inbox holds un-optimized books. This
+  // covers both a cold boot and the reboot that Google Drive sync performs after
+  // pulling files (it lands here). Guarded to fire at most once per boot so
+  // backing out of the web server doesn't immediately re-trap the user; a fresh
+  // boot with a still-non-empty inbox will offer it again.
+  static bool autoOptimizeChecked = false;
+  if (!autoOptimizeChecked) {
+    autoOptimizeChecked = true;
+    if (SETTINGS.autoOptimizeInboxOnBoot && inboxHasUnoptimizedBooks()) {
+      LOG_INF("HOME", "Inbox has un-optimized books; launching web optimizer");
+      activityManager.goToFileTransfer();
+      return;
+    }
+  }
 
   hasOpdsServers = OPDS_STORE.hasServers();
 
